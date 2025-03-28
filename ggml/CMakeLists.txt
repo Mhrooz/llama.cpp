@@ -194,6 +194,8 @@ set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
 set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
 
+option(GGML_RKNN                            "ggml: use RKNN"                                  OFF)
+
 option(GGML_OPENCL                          "ggml: use OpenCL"                                OFF)
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
 option(GGML_OPENCL_EMBED_KERNELS            "ggml: embed kernels"                             ON)
@@ -258,6 +260,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-blas.h
     include/ggml-cann.h
     include/ggml-cpp.h
+    include/ggml-rknn.h
     include/ggml-cuda.h
     include/ggml-kompute.h
     include/ggml-opt.h
