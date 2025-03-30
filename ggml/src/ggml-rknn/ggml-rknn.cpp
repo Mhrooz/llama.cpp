@@ -490,13 +490,22 @@ static bool ggml_rk_can_mul_mat(const struct ggml_tensor * src0, const struct gg
     printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, ne0: %d, ne1: %d\n", (int)ne00, (int)ne01, (int)ne10, (int)ne11, (int)ne0, (int)ne1);
     //ne00: 960, ne01: 1, ne10: 960, ne11: 2880, ne0: 1, ne1: 2880
 
+    if(ne00 %32 != 0 || ne11%32 != 0){
+        return false;
+    }
+
+    if(dst->type != GGML_TYPE_F32){
+        return false;
+    }
+
+    return true;
     // TODO: find the optimal values for these
-    return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
-            (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
-             dst->type == GGML_TYPE_F32 &&
-             //(ne0 % 32 == 0 && ne1 % 32 == 0) &&
-             (ne1 % 32 == 0) &&
-            (ne0 >= 1 && ne1 >= 32 && ne10 >= 32);
+    // return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
+    //         (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+    //          dst->type == GGML_TYPE_F32 &&
+    //          //(ne0 % 32 == 0 && ne1 % 32 == 0) &&
+    //          (ne1 % 32 == 0) &&
+    //         (ne0 >= 1 && ne1 >= 32 && ne10 >= 32);
             //(ne0 >= 32 && ne1 >= 32 && ne10 >= 32);
 }
 
