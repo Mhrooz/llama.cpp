@@ -191,12 +191,13 @@ struct ggml_backend_registry {
 #ifdef GGML_USE_KOMPUTE
         register_backend(ggml_backend_kompute_reg());
 #endif
-#ifdef GGML_USE_CPU
-        register_backend(ggml_backend_cpu_reg());
-#endif
 #ifdef GGML_USE_RKNN
         register_backend(ggml_backend_rknn_reg());
 #endif
+#ifdef GGML_USE_CPU
+        register_backend(ggml_backend_cpu_reg());
+#endif
+
     }
 
     ~ggml_backend_registry() {

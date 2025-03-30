@@ -70,7 +70,7 @@ void compute_submat_mul(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
 
 struct ggml_backend_rknn_context {
-    int n_threads = 1;
+    int n_threads = 3;
 };
 
 struct ggml_rknpu2_matmul_kernel{
