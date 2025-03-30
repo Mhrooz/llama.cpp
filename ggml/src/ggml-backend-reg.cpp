@@ -53,6 +53,10 @@
 #include "ggml-blas.h"
 #endif
 
+#ifdef GGML_USE_RKNN
+#include "ggml-rknn.h"
+#endif
+
 #ifdef GGML_USE_RPC
 #include "ggml-rpc.h"
 #endif
@@ -189,6 +193,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());
+#endif
+#ifdef GGML_USE_RKNN
+        register_backend(ggml_backend_rknn_reg());
 #endif
     }
 
