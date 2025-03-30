@@ -791,6 +791,8 @@ bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
         || (src0 != nullptr && src0->extra)
         || (src1 != nullptr && src1->extra);
 
+    printf("ggml_rk_can_mul_mat: %d\n", ggml_rk_can_mul_mat(src0, src1, tensor));
+
     if(tensor->op == GGML_OP_MUL_MAT){
         if(!any_on_device && !ggml_rk_can_mul_mat(tensor->src[0], tensor->src[1], tensor)){
             return false;
