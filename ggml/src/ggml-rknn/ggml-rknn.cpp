@@ -198,6 +198,7 @@ rknn_tensor_type rknpu2_matmul_input_type_to_output_type(rknn_tensor_type type)
     }
 }
 static ggml_status ggml_backend_rknn_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    printf("computing graph\n");
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
