@@ -316,12 +316,13 @@ static void ggml_backend_rknn_device_get_props(ggml_backend_dev_t dev, struct gg
     props->description = ggml_backend_rknn_device_get_description(dev);
     props->type        = ggml_backend_rknn_device_get_type(dev);
     ggml_backend_rknn_device_get_memory(dev, &props->memory_free, &props->memory_total);
-    props->caps = {
+    props->caps = { // check src/llama-context.cpp:276
         /* .async                 = */ false,
-        /* .host_buffer           = */ false,
+        /* .host_buffer           = */ true,
         /* .buffer_from_host_ptr  = */ true,
         /* .events                = */ false,
     };
+
 }
 static ggml_backend_t ggml_backend_rknn_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     return ggml_backend_rknn_init();
