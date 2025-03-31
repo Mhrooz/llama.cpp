@@ -1465,6 +1465,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         return it->second;
     };
 
+    LLAMA_LOG_INFO("create ctx_for_buft lambda representation...\n");
+
     const auto TENSOR_DUPLICATED   = llama_model_loader::TENSOR_DUPLICATED;
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -3764,6 +3766,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     ml.done_getting_tensors();
+    LLAMA_LOG_INFO("%s: done getting tensors\n", __func__);
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
