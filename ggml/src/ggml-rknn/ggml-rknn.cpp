@@ -13,6 +13,7 @@
 #include "fp16/Float16.h"
 
 #include <string.h>
+#include <cstring>
 
 #include <thread>
 #include <vector>
@@ -21,11 +22,7 @@
 #include <cstdint>
 #include <chrono>
 #include <atomic>
-#include <fstream>
-#include <limits>
 #include <vector>
-#include <string>
-#include <cmath>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
