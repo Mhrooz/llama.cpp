@@ -1435,6 +1435,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     pimpl->dev_layer.resize(n_layer);
     LLAMA_LOG_INFO("dev_layer resize done\n");
     for (int il = 0; il < n_layer; ++il) {
+        LLAMA_LOG_INFO("dev_layer %d\n", il);
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
     LLAMA_LOG_INFO("dev_layer define every layer done\n");
