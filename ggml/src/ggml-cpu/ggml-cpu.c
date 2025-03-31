@@ -10305,7 +10305,6 @@ static void ggml_compute_forward_soft_max_f32(
         ggml_vec_max_f32(nc, &max, wp);
 
         ggml_float sum = ggml_vec_soft_max_f32(nc, dp, wp, max);
-        printf("sum = %f\n", sum);
         assert(sum > 0.0);
 
         sum = 1.0/sum;
