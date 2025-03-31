@@ -63,6 +63,7 @@ rknn_tensor_type rknpu2_matmul_input_type_to_output_type(rknn_tensor_type type);
 rknn_matmul_type rknpu2_matmul_type_from_rknn_type(rknn_tensor_type type);
 const char* rknpu2_matmul_type_to_string(rknn_matmul_type type);
 const char* rknpu2_tensor_type_to_string(rknn_tensor_type type);
+static void * ggml_backend_rknn_get_proc_address(ggml_backend_reg_t reg, const char * name) ;
 
 void compute_submat_mul(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int64_t row_start, int64_t row_end, int thread_idx, rknn_matmul_type type, bool partition_A) ;
 
@@ -423,8 +424,19 @@ static struct ggml_backend_reg_i ggml_backend_rknn_reg_i = {
     /* .get_name         = */ ggml_backend_rknn_reg_get_name,
     /* .device_count     = */ ggml_backend_rknn_reg_device_count,
     /* .device_get       = */ ggml_backend_rknn_reg_device_get,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_rknn_get_proc_address,
 };
+
+static void * ggml_backend_rknn_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (std::strcmp(name, "ggml_backend_set_n_threads") == 0) {
+        return (void *)ggml_backend_rknn_set_n_threads;
+    }
+    return NULL;
+
+    GGML_UNUSED(reg);
+    GGML_UNUSED(name);
+    return NULL;
+}
 
 
 ggml_backend_reg_t ggml_backend_rknn_reg(void) {
