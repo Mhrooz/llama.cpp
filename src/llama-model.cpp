@@ -1425,18 +1425,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    LLAMA_LOG_INFO("dev_input1");
+    LLAMA_LOG_INFO("dev_input1\n");
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
-    LLAMA_LOG_INFO("dev_input");
+    LLAMA_LOG_INFO("dev_input\n");
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer);
+    LLAMA_LOG_INFO("dev_layer resize done\n");
     for (int il = 0; il < n_layer; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
-    LLAMA_LOG_INFO("dev_layer resize done");
+    LLAMA_LOG_INFO("dev_layer define every layer done\n");
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer);
