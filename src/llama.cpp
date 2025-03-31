@@ -92,6 +92,7 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     model.t_start_us = tm.t_start_us;
 
     try {
+        printf("ml initializing\n");
         llama_model_loader ml(fname, splits, params.use_mmap, params.check_tensors, params.kv_overrides);
         printf("ml initialized\n");
 
