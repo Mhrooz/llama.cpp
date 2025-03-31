@@ -12137,6 +12137,11 @@ llama_model_params llama_model_default_params() {
     result.n_gpu_layers = 999;
 #endif
 
+#ifdef GGML_USE_RKNN
+    printf("RKNN support is enabled\n");
+    printf("RKNN set n_gpu_layers to 999\n");
+    result.n_gpu_layers = 999;
+#endif
     return result;
 }
 
