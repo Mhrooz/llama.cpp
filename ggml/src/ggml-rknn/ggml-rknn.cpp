@@ -27,6 +27,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sys/sysinfo.h>
 #include <iostream>
 
 using namespace rknpu2;
@@ -301,6 +302,15 @@ static const char * ggml_backend_rknn_device_get_description(ggml_backend_dev_t 
 }
 static void ggml_backend_rknn_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     // TODO
+    struct sysinfo info;
+    if (sysinfo(&info) == 0) {
+        *free = info.freeram;
+        *total = info.totalram;
+        *free = *free * info.mem_unit;
+        *total = *total * info.mem_unit;
+    } else {
+        std::cerr << "sysinfo failed" << "\n";
+    }
     *free = 0;
     *total = 0;
 
