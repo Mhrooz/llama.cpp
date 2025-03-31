@@ -1435,6 +1435,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer);
+    LLAMA_LOG_DEBUG("load_tensors: output layer assigned to device %s\n", ggml_backend_dev_name(pimpl->dev_output.dev));
 
     // one ggml context per buffer type
     int max_n_tensors = ml.n_tensors;
