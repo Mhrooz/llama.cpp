@@ -307,7 +307,7 @@ static void ggml_backend_rknn_device_get_memory(ggml_backend_dev_t dev, size_t *
     GGML_UNUSED(dev);
 }
 static enum ggml_backend_dev_type ggml_backend_rknn_device_get_type(ggml_backend_dev_t dev) {
-    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
 
     GGML_UNUSED(dev);
 }
