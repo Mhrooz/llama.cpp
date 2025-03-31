@@ -1426,12 +1426,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    LLAMA_LOG_DEBUG("dev_input");
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
+    LLAMA_LOG_DEBUG("dev_layer resize done");
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer);
