@@ -116,8 +116,11 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }
 
+        printf("model loaded\n");
         model.load_stats(ml);
+        printf("stats loaded\n");
         model.print_info();
+        printf("info printed\n");
 
         if (params.vocab_only) {
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
