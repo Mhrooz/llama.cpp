@@ -225,7 +225,7 @@ llama_context::llama_context(
 
         for (auto & backend : backends) {
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
-            auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+            auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get())); // return ACCEL for RKNN backend
 
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
@@ -239,6 +239,9 @@ llama_context::llama_context(
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
         }
+
+        // backend_buft now contains the buffer types for each backend
+        // backend_ptrs now contains the backend pointers
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
