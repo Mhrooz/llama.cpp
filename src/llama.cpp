@@ -8,6 +8,8 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+// Ensure the correct path to ggml-backend-impl.h is provided
+#include "../ggml/src/ggml-backend-impl.h" // Adjust the path as needed
 
 #include <algorithm>
 #include <cstddef>
@@ -167,6 +169,7 @@ static struct llama_model * llama_model_load_from_file_impl(
     if (params.devices) {
         for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
             model->devices.push_back(*dev);
+            LLAMA_LOG_INFO("dev name: %s \n",(*dev)->iface.get_name(*dev));
         }
     } else {
         std::vector<ggml_backend_dev_t> rpc_servers;
@@ -240,6 +243,7 @@ struct llama_model * llama_model_load_from_file(
         const char * path_model,
         struct llama_model_params params) {
     std::vector<std::string> splits = {};
+    LLAMA_LOG_INFO("params devices: %s\n", params.devices ? "not null" : "null");
     return llama_model_load_from_file_impl(path_model, splits, params);
 }
 

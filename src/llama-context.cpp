@@ -5,6 +5,8 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-kv-cache.h"
+#include "../ggml/src/ggml-impl.h"
+#include "../ggml/include/ggml-backend.h"
 
 #include <cassert>
 #include <cstring>
@@ -1700,6 +1702,18 @@ ggml_status llama_context::graph_compute(
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
+
+    
+    struct ggml_backend_sched * _sched = sched.get();
+
+    struct ggml_backend_sched_split * splits = _sched->splits;
+
+    for (int i = 0; i < _sched->n_splits; ++i) {
+        auto * split = &splits[i];
+        LLAMA_LOG_INFO("split_id: %d, backend_id: %d\n", i, split->backend_id);
+    }
+
+
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
