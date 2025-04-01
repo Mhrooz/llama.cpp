@@ -311,8 +311,6 @@ static void ggml_backend_rknn_device_get_memory(ggml_backend_dev_t dev, size_t *
     } else {
         std::cerr << "sysinfo failed" << "\n";
     }
-    *free = 0;
-    *total = 0;
 
     GGML_UNUSED(dev);
 }
