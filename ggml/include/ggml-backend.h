@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-alloc.h"
+#include "../src/ggml-impl.h"
 
 #ifdef GGML_BACKEND_SHARED
 #    if defined(_WIN32) && !defined(__MINGW32__)
