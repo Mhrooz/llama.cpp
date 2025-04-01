@@ -11,7 +11,6 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
-#include "ggml-impl.h"
 
 #include <assert.h>
 #include <limits.h>
