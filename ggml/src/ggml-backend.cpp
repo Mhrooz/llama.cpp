@@ -606,76 +606,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
 
-// scheduler
 
-#ifndef GGML_SCHED_MAX_BACKENDS
-#define GGML_SCHED_MAX_BACKENDS 16
-#endif
-
-#ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#define GGML_SCHED_MAX_SPLIT_INPUTS GGML_MAX_SRC
-#endif
-
-#ifndef GGML_SCHED_MAX_COPIES
-#define GGML_SCHED_MAX_COPIES 4
-#endif
-
-struct ggml_backend_sched_split {
-    int backend_id;
-    int i_start;
-    int i_end;
-    struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
-    int n_inputs;
-    // graph view of this split
-    struct ggml_cgraph graph;
-};
-
-struct ggml_backend_sched {
-    bool is_reset; // true if the scheduler has been reset since the last graph split
-    bool is_alloc;
-
-    int n_backends;
-
-    ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
-    ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
-    ggml_gallocr_t galloc;
-
-    // hash map of the nodes in the graph
-    struct ggml_hash_set  hash_set;
-    int                 * hv_tensor_backend_ids; // [hash_set.size]
-    struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
-
-    int * node_backend_ids; // [graph_size]
-    int * leaf_backend_ids; // [graph_size]
-
-    int * prev_node_backend_ids; // [graph_size]
-    int * prev_leaf_backend_ids; // [graph_size]
-
-    // copy of the graph with modified inputs
-    struct ggml_cgraph graph;
-
-    // graph splits
-    struct ggml_backend_sched_split * splits;
-    int n_splits;
-    int splits_capacity;
-
-    // pipeline parallelism support
-    int n_copies;
-    int cur_copy;
-    ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
-    struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
-    int n_graph_inputs;
-
-    struct ggml_context * ctx;
-
-    ggml_backend_sched_eval_callback callback_eval;
-    void * callback_eval_user_data;
-
-    char * context_buffer;
-    size_t context_buffer_size;
-
-    int debug;
-};
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
