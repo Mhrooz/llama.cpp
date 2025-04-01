@@ -287,12 +287,13 @@
             ]
         },
         {
-            "name": "x64-windows-vulkan-release",
-            "inherits": [
-                "base",
-                "vulkan",
-                "release"
-            ]
+            "name": "arm64-linux-rknn-debug",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "GGML_RKNN": "ON",
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
         }
     ]
 }
