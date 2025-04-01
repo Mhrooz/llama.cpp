@@ -1416,11 +1416,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < (int) hparams.n_layer && hparams.is_swa(il); // is_swa = is sliding window attention
         LLAMA_LOG_INFO("get_layer_buft_list: layer %3d, is_swa = %d\n", il, is_swa);
+        LLAMA_LOG_INFO("i_gpu_start: %d, act_gpu_layers = %d\n", i_gpu_start, act_gpu_layers);
+        LLAMA_LOG_INFO("il - i_gpu_start = %d\n", il - i_gpu_start);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_INFO("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        LLAMA_LOG_INFO("n_devices = %d\n", n_devices());
+        // check splits
+        for(size_t i = 0; i < n_devices(); ++i) {
+            LLAMA_LOG_INFO("split[%d] = %f\n", (int)i, splits[i]);
+        }
+        const int layer_gpu = std::upper_bound(
+            splits.begin(), 
+            splits.begin() + n_devices(), 
+            float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu);
         LLAMA_LOG_INFO("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};

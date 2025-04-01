@@ -351,6 +351,7 @@ static ggml_backend_buffer_t ggml_backend_rknn_device_buffer_from_host_ptr(ggml_
 }
 static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
 
+    printf("%s: op = %s\n", __func__, ggml_op_name(op->op));
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -361,23 +362,54 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
 
         case GGML_OP_MUL_MAT:
         {
-            // BLAS usually is only faster for large matrices
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
+            const struct ggml_tensor * dst = op;
+            const int64_t ne00 = src0->ne[0]; // k
+            const int64_t ne01 = src0->ne[1]; // m
+            const int64_t ne10 = src1->ne[0]; // k
+            const int64_t ne11 = src1->ne[1]; // n
+            const int64_t ne0 = dst->ne[0]; // m
+            const int64_t ne1 = dst->ne[1]; // n
 
-            const int64_t ne10 = src1->ne[0];
+            printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, ne0: %d, ne1: %d\n", (int)ne00, (int)ne01, (int)ne10, (int)ne11, (int)ne0, (int)ne1);
+            //ne00: 960, ne01: 1, ne10: 960, ne11: 2880, ne0: 1, ne1: 2880
 
-            const int64_t ne0 = op->ne[0];
-            const int64_t ne1 = op->ne[1];
+            bool result = true;
+
+            if(ne00 %32 != 0 || ne11%32 != 0){
+                printf("ne00 %d %% 32 != 0 || ne11 %d %% 32 != 0\n", (int)ne00, (int)ne11);
+                result = false;
+            }
+
+            if(dst->type != GGML_TYPE_F32){
+                printf("dst->type != GGML_TYPE_F32\n");
+                result = false;
+            }
+
+            printf("result = %d\n", result);
+            return result;
+
+
+            // BLAS usually is only faster for large matrices
+            // const struct ggml_tensor * src0 = op->src[0];
+            // const struct ggml_tensor * src1 = op->src[1];
+
+            // const int64_t ne10 = src1->ne[0];
+
+            // const int64_t ne0 = op->ne[0];
+            // const int64_t ne1 = op->ne[1];
 
             // TODO: find the optimal value
-            const int64_t min_batch = 32;
+            // const int64_t min_batch = 32;
 
-            return ggml_is_contiguous(src0) &&
-                   ggml_is_contiguous(src1) &&
-                   src1->type == GGML_TYPE_F32 &&
-                   (ne0 >= min_batch && ne1 >= min_batch && ne10 >= min_batch) &&
-                   (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
+            // bool result = ggml_is_contiguous(src0) &&
+            //        ggml_is_contiguous(src1) &&
+            //        src1->type == GGML_TYPE_F16 &&
+            //        (ne0 >= min_batch && ne1 >= min_batch && ne10 >= min_batch) &&
+            //        (src0->type == GGML_TYPE_F16 || ggml_get_type_traits(src0->type)->to_float != NULL);
+            // printf("result = %d\n", result);
+            // return result;
         }
 
         default:
@@ -772,7 +804,6 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
     else{
         printf("using multi threads B \n");
-
 
         // matrix B has transposed -> matrix B is column major
         const int64_t n = src1->ne[1]; // matrix B columns
