@@ -197,7 +197,7 @@ rknn_tensor_type rknpu2_matmul_input_type_to_output_type(rknn_tensor_type type)
     }
 }
 static ggml_status ggml_backend_rknn_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    printf("computing graph\n");
+    // printf("computing graph\n");
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
@@ -217,22 +217,22 @@ static ggml_status ggml_backend_rknn_graph_compute(ggml_backend_t backend, ggml_
 
 static void ggml_rknn2_free(ggml_backend_t backend) {
     //ggml_backend_rknn_context * ctx = (ggml_backend_rknn_context *) backend->context;
-    printf("deleting backends\n");
+    // printf("deleting backends\n");
     // if(ctx != nullptr) delete ctx;
     for(int i = 0 ; i < matmul_kernels_count; i++){
         ggml_rknpu2_matmul_kernel *kernel = &matmul_kernels[i];
-        printf("kernels: %d\n", (int)i);
+        // printf("kernels: %d\n", (int)i);
         rknn_destroy_mem(kernel->ctx, kernel->A);
-        printf("kernels: %d\n", (int)i);
+        // printf("kernels: %d\n", (int)i);
         // rknn_destroy_mem(kernel->ctx, kernel->B);
-        printf("kernels: %d\n", (int)i);
+        // printf("kernels: %d\n", (int)i);
         rknn_destroy_mem(kernel->ctx, kernel->C);
-        printf("kernels: %d\n", (int)i);
+        // printf("kernels: %d\n", (int)i);
         rknn_matmul_destroy(kernel->ctx);
-        printf("kernels: %d\n", (int)i);
+        // printf("kernels: %d\n", (int)i);
     }
 
-    printf("deleting backends\n");
+    // printf("deleting backends\n");
     delete backend;
 }
 
@@ -383,11 +383,11 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
             // }
 
             if(dst->type != GGML_TYPE_F32){
-                printf("dst->type != GGML_TYPE_F32\n");
+                // printf("dst->type != GGML_TYPE_F32\n");
                 result = false;
             }
 
-            printf("result = %d\n", result);
+            // printf("result = %d\n", result);
             return result;
 
 
@@ -666,7 +666,7 @@ void compute_submat_mul(int64_t m, // matrix A row
     int thread_idx,
     rknn_matmul_type type,
     int64_t dst_n) {
-    printf("partition B\n");
+    // printf("partition B\n");
 
     // columns of the sub_matrix of B
     int64_t sub_n = row_end - row_start;
@@ -742,9 +742,9 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     std::vector<std::thread> threads;
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    printf("initilized threads time: %lld\n", duration.count());
+    // printf("initilized threads time: %lld\n", duration.count());
 
-    printf("using multi threads B \n");
+    // printf("using multi threads B \n");
 
     // matrix B has transposed -> matrix B is column major
     const int64_t n = src1->ne[1]; // matrix B columns
@@ -766,7 +766,7 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         pad_k = (k / 32 + 1) * 32;
     }
 
-    printf("pad_n: %d, pad_k: %d\n", (int)pad_n, (int)pad_k);
+    // printf("pad_n: %d, pad_k: %d\n", (int)pad_n, (int)pad_k);
     // pad the matrix
     // first, we need to allocate the memory for the matrix
     void * A_pad_data = malloc(m * pad_k * sizeof(rknpu2::float16)); //released
@@ -802,7 +802,7 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
     }
 
-    printf("zero padding done!\n");
+    // printf("zero padding done!\n");
 
 
     //measure the overhead of creating the threads
@@ -830,7 +830,7 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // run the thread
         threads.emplace_back([m, pad_k, A_compute_data, B_transposed_data, dst, col_start, col_end, t, inference_type](){
         //compute_submat_mul(m,k, A_data, B_data, dst, col_start, col_end, t, inference_type);
-            printf("thread %d: col_start: %d, col_end: %d\n", t, (int)col_start, (int)col_end);
+            // printf("thread %d: col_start: %d, col_end: %d\n", t, (int)col_start, (int)col_end);
 
             int64_t dst_n = dst->ne[1];
             compute_submat_mul(m,pad_k, A_compute_data, B_transposed_data, dst, col_start, col_end, t, inference_type, dst_n);
@@ -838,7 +838,7 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
     end = std::chrono::high_resolution_clock::now();
     duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    printf("thread creation time: %lld\n", duration.count());
+    // printf("thread creation time: %lld\n", duration.count());
 
 
     start = std::chrono::high_resolution_clock::now();
@@ -848,7 +848,7 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
     end = std::chrono::high_resolution_clock::now();
     duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    printf("waiting computation time: %lld\n", duration.count());
+    // printf("waiting computation time: %lld\n", duration.count());
 
     // release memory
     free(A_pad_data);
@@ -873,7 +873,7 @@ bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
         || (src0 != nullptr && src0->extra)
         || (src1 != nullptr && src1->extra);
 
-    printf("ggml_rk_can_mul_mat: %d\n", ggml_rk_can_mul_mat(src0, src1, tensor));
+    // printf("ggml_rk_can_mul_mat: %d\n", ggml_rk_can_mul_mat(src0, src1, tensor));
 
     if(tensor->op == GGML_OP_MUL_MAT){
         if(!any_on_device && !ggml_rk_can_mul_mat(tensor->src[0], tensor->src[1], tensor)){
@@ -896,6 +896,6 @@ bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
     func(backend, tensor->src[0], tensor->src[1], tensor, matmul_type);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    printf("total time: %lld\n", duration.count());
+    // printf("total time: %lld\n", duration.count());
     return true;
 }
