@@ -382,6 +382,9 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
             //     result = false;
             // }
 
+            if(src0->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_F16)
+                return false;
+
             if(dst->type != GGML_TYPE_F32){
                 // printf("dst->type != GGML_TYPE_F32\n");
                 result = false;
@@ -816,22 +819,9 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         void * A_compute_data = A_pad_data;
         // printf("col_start: %d, col_end: %d\n", (int)col_start, (int)col_end);
         void * B_compute_data = (rknpu2::float16*)B_pad_data + col_start * pad_k;
-        // printf("B_data: %p\n", B_data);
 
-        // printf("m: %d\n", (int)m);
-        // printf("pad_k: %d\n", (int)pad_k);
-        // printf("A_compute_data: %p\n", A_compute_data);
-        // printf("B_compute_data: %p\n", B_compute_data);
-        // printf("dst: %p\n", dst);
-        // printf("col_start: %d\n", (int)col_start);
-        // printf("col_end: %d\n", (int)col_end);
-        // printf("t: %d\n", t);
-        // printf("inference_type: %d\n", inference_type);
         // run the thread
         threads.emplace_back([m, pad_k, A_compute_data, B_transposed_data, dst, col_start, col_end, t, inference_type](){
-        //compute_submat_mul(m,k, A_data, B_data, dst, col_start, col_end, t, inference_type);
-            // printf("thread %d: col_start: %d, col_end: %d\n", t, (int)col_start, (int)col_end);
-
             int64_t dst_n = dst->ne[1];
             compute_submat_mul(m,pad_k, A_compute_data, B_transposed_data, dst, col_start, col_end, t, inference_type, dst_n);
         });
