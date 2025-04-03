@@ -1710,7 +1710,7 @@ ggml_status llama_context::graph_compute(
 
     for (int i = 0; i < _sched->n_splits; ++i) {
         auto * split = &splits[i];
-        LLAMA_LOG_INFO("split_id: %d, backend_id: %d\n", i, split->backend_id);
+        // LLAMA_LOG_INFO("split_id: %d, backend_id: %d\n", i, split->backend_id);
     }
 
 
