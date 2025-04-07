@@ -608,7 +608,7 @@ static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(int m, 
         kernel->info.K = k;
         kernel->info.N = n;
         kernel->info.type = type;
-        kernel->info.B_layout = 0; // B use native layout (weight)
+        kernel->info.B_layout = 1; // B use native layout (weight)
         kernel->info.AC_layout = 0; // A and C use original layout (intermediate)
     
         // printf("Creating RKNPU2 matmul kernel: src0(%d, %d) x src1(%d, %d) = dst(%d, %d) %s\n", m, k, k, n, m, n, rknpu2_matmul_type_to_string(type));
@@ -701,6 +701,7 @@ void compute_submat_mul(int64_t m, // matrix A row
     // printf("memcpy time: %lld\n", duration.count());
 
     if(initialized == 0){
+        rknn_B_normal_layout_to_native_layout(B_data, sub_kernel->B->virt_addr,k, sub_n, &(sub_kernel->info));
         rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->A, &sub_kernel->io_attr.A);
         rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->B, &sub_kernel->io_attr.B);
         rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->C, &sub_kernel->io_attr.C);
