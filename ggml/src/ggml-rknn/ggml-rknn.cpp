@@ -677,12 +677,12 @@ void compute_submat_mul(int64_t m, // matrix A row
     size_t B_size = sub_n * k * sizeof(rknpu2::float16);
 
     // printf("m: %d, k: %d, sub_n: %d\n",  (int)m, (int)k, (int)sub_n);
-    // check the A_data and B_data
     
 
     int initialized = 0;
     // measure the overhead of creating the kernel
     auto start = std::chrono::high_resolution_clock::now();
+    // printf("sub_n: %d, m: %d, k: %d\n", (int)sub_n, (int)m, (int)k);
     ggml_rknpu2_matmul_kernel* sub_kernel = ggml_rknpu2_matmul_kernel_create(A_data, B_data, A_size, B_size, m, k, sub_n, type, thread_idx, initialized);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -720,9 +720,15 @@ void compute_submat_mul(int64_t m, // matrix A row
 
 
     // write back the result to dst
-    for(int i = 0 ; i < m ; i++){
-        for(int j = 0 ; j<dst_n ; j++){
-            ((float *)dst->data)[i * dst_n + j] = ((float*)sub_kernel->C->virt_addr)[i * sub_n + j];
+    // for(int i = 0 ; i < m ; i++){
+    //     for(int j = 0 ; j<dst_n ; j++){
+    //         ((float *)dst->data)[i * dst_n + j] = ((float*)sub_kernel->C->virt_addr)[i * sub_n + j];
+    //     }
+    // }
+
+    for(int i = 0 ; i < dst_n ; i++){ //row
+        for(int j = 0 ; j < m; j++){ //column
+            ((float *)dst->data)[i * m + j] = ((float*)sub_kernel->C->virt_addr)[j * sub_n + i];
         }
     }
 
