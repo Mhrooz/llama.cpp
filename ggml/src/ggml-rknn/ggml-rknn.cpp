@@ -11,6 +11,7 @@
 #include "rknn_api.h"
 #include "rknn_matmul_api.h"
 #include "fp16/Float16.h"
+#include "model_related_config.h"
 
 #include <string.h>
 #include <cstring>
@@ -27,12 +28,21 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <iostream>
 #include <fcntl.h>
 #include <sys/sysinfo.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <unistd.h>
-#include <iostream>
+#include <omp.h>
+#include <arm_neon.h>
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
+
+#define GGML_COMMON_DECL_C
+
+#include "ggml-common.h"
 
 using namespace rknpu2;
 #define UNUSED(x) (void)(x)
@@ -52,39 +62,45 @@ using namespace rknpu2;
 #define DMA_BUF_IOCTL_SYNC   _IOW(DMA_BUF_BASE, 0, uint64_t)
 #define CMA_HEAP_SIZE       (1024 * 1024)
 
-
-
-
-static uint64_t rknpu2_allocated_bytes = 0;
-
-void A00xB00(const int64_t A_row_00, const int64_t B_col_00, ggml_tensor *dst, int64_t n, int offset_col, int offset_row);
-void A00xB00(const int64_t A_row_00, const int64_t B_col_00, ggml_tensor *dst, int64_t n);
-void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, const int64_t B_row_10, const int64_t B_col_10, void *pad_A01, void *pad_B10, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row);
-
-void pad_side_matrix(const int64_t A_row_01, const int64_t A_col_01, const void *A_data, const int64_t A_row_00, int64_t k, void *&pad_A01, const int64_t A_col_00);
-
-void pad_side_matrix(const int64_t A_row_01, const int64_t A_col_01, void *&pad_A01, const int64_t A_col_00, const void *A_data, int64_t k);
-
-void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, const int64_t B_row_10, const int64_t B_col_10, void *pad_A01, void *pad_B10, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id);
-
-
-bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor);
-// prototypes
-rknn_tensor_type ggml_type_to_rknn_type(ggml_type type);
-rknn_tensor_type rknpu2_matmul_type_to_rknn_type_input(rknn_matmul_type type);
-rknn_tensor_type rknpu2_matmul_input_type_to_output_type(rknn_tensor_type type);
-rknn_matmul_type rknpu2_matmul_type_from_rknn_type(rknn_tensor_type type);
-const char* rknpu2_matmul_type_to_string(rknn_matmul_type type);
-const char* rknpu2_tensor_type_to_string(rknn_tensor_type type);
-
-void compute_submat_mul(int64_t m, int64_t k, const void * A_data, void * B_data, ggml_tensor * dst, int64_t row_start, int64_t row_end, int thread_idx, rknn_matmul_type type) ;
-
-
-
-
-struct ggml_backend_rknn_context {
-    int n_threads = 1;
+struct matrixShape{
+    int64_t row;
+    int64_t col;
 };
+struct matrixPair{
+    matrixShape src0;
+    matrixShape src1;
+};
+
+bool read_shape_pairs_from_json(
+    const std::string& filename,
+    std::vector<matrixPair>& out_pairs) {
+
+    std::ifstream ifs(filename);
+    if (!ifs.is_open()) {
+        std::cerr << "Cannot open JSON file: " << filename << std::endl;
+        return false;
+    }
+
+    json j;
+    try {
+        ifs >> j;
+        // 拿到 pairs 数组
+        const auto& arr = j.at("pairs");
+        for (const auto& item : arr) {
+            matrixPair sp;
+            sp.src0.row = item.at("src0").at("row").get<int64_t>();
+            sp.src0.col = item.at("src0").at("col").get<int64_t>();
+            sp.src1.row = item.at("src1").at("row").get<int64_t>();
+            sp.src1.col = item.at("src1").at("col").get<int64_t>();
+            out_pairs.push_back(sp);
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "Get JSON failed: " << e.what() << std::endl;
+        return false;
+    }
+    return true;
+}
+
 
 struct ggml_rknpu2_matmul_kernel{
     void* workdata;
@@ -103,15 +119,365 @@ struct ggml_rknpu2_matmul_kernel{
     void * B_data = NULL;
     size_t A_size = 0; //0 means not allocated
     size_t B_size = 0;
+    bool B_is_copied = false;
 };
 
+static inline int64_t getCurrentTimeUs()
+{
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return tv.tv_sec * 1000000 + tv.tv_usec;
+}
 
 
+static uint64_t rknpu2_allocated_bytes = 0;
 
-#define GGML_RKNPU2_MAX_MATMUL_KERNELS 16
+struct matrix_ctx{
+    int64_t row;
+    int64_t col;
+    void* data;
+    char* name;
+};
+
+struct in_kernel_time{
+    double memcpy_to_kernel_time;
+    double find_kernel_time;
+    double set_io_time;
+    double run_time;
+    double memcpy_to_result_time;
+    double sum_result_time;
+};
+
+void matrix_B_to_perf_layout_single_thread(int total_blocks_outer, int total_blocks_j, int32_t subN, int32_t subK, int32_t K, float16 *__restrict__ dst_ptr, const float16 *start_point, int thread_idx, int total_threads);
+void A00xB00(const int64_t A_row_00, const int64_t B_col_00, ggml_tensor *dst, int64_t n, int offset_col, int offset_row);
+void A00xB00(const int64_t A_row_00, const int64_t B_col_00, ggml_tensor *dst, int64_t n);
+void side_matrix_multiplication(matrix_ctx A, matrix_ctx B, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row, in_kernel_time &kernel_time);
+void side_matrix_multiplication(matrix_ctx A, matrix_ctx B, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row, in_kernel_time &kernel_time, bool matrix_B00_need_set_io);
+void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, const int64_t B_row_10, const int64_t B_col_10, void *pad_A01, void *pad_B10, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row, in_kernel_time &kernel_time);
+void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, const int64_t B_row_10, const int64_t B_col_10, void *pad_A01, void *pad_B10, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row, in_kernel_time &kernel_time, bool matrix_B00_need_set_io);
+
+void pad_side_matrix(const int64_t A_row_01, const int64_t A_col_01, const void *A_data, const int64_t A_row_00, int64_t k, void *&pad_A01, const int64_t A_col_00);
+
+void pad_side_matrix(const int64_t A_row_01, const int64_t A_col_01, void *&pad_A01, const int64_t A_col_00, const void *A_data, int64_t k);
+
+#define GGML_RKNPU2_MAX_MATMUL_KERNELS 32
 static ggml_rknpu2_matmul_kernel matmul_kernels[GGML_RKNPU2_MAX_MATMUL_KERNELS];
 
 static int matmul_kernels_count = 0;
+
+const char* rknpu2_matmul_type_to_string(rknn_matmul_type type)
+{
+    switch(type) {
+        case RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32:
+            return "FLOAT16_MM_FLOAT16_TO_FLOAT32";
+        case RKNN_INT8_MM_INT8_TO_INT32:
+            return "INT8_MM_INT8_TO_INT32";
+        case RKNN_INT4_MM_INT4_TO_INT16:
+            return "INT4_MM_INT4_TO_INT16";
+        default:
+            GGML_ASSERT(0);
+    }
+}
+
+static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(int m, int k, int n, rknn_matmul_type type, int thread_idx, const void * A_data, void * B_data, size_t A_size, size_t B_size) {
+  for (int i = 0; i < matmul_kernels_count; i++) {
+    ggml_rknpu2_matmul_kernel *kernel = &matmul_kernels[i];
+    if (
+            kernel->info.M == m &&
+            kernel->info.K == k &&
+            kernel->info.N == n &&
+            kernel->is_using == false &&
+            // kernel->thread_idx == thread_idx &&
+            kernel->info.type == type 
+            // kernel->A_data == A_data &&
+            // kernel->B_data == B_data &&
+            // kernel->A_size == A_size &&
+            // kernel->B_size == B_size
+        )
+      return kernel;
+  }
+  return NULL;
+}
+
+// MARK: Kernel find
+
+static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(matrix_ctx A, matrix_ctx B, rknn_matmul_type type, int thread_idx){
+    printf("ggml_rknpu2_matmul_kernel_find: %d, %d, %d\n", A.row, A.col, B.col);
+    return ggml_rknpu2_matmul_kernel_find(A.row, A.col, B.col, type, thread_idx, NULL, NULL, 0, 0);
+}
+
+ggml_rknpu2_matmul_kernel* ggml_rknpu2_matmul_kernel_create(const void* A_data, void* B_data, size_t A_size, size_t B_size, int m, int k, int n, rknn_matmul_type type, int core_number, int &initialized){
+    ggml_rknpu2_matmul_kernel* kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, type, core_number, A_data, B_data, A_size, B_size);
+    if(kernel != NULL){
+        printf("find an existed kernel!\n");
+        // initialized = 1;
+        return kernel;
+    }
+
+    else{
+        printf("Creating Kernel inside the function\n");
+        printf("parameters: %d, %d, %d, %d\n", m, k, n, type);
+        // GGML_ASSERT(matmul_kernels_count < GGML_RKNPU2_MAX_MATMUL_KERNELS);
+
+        kernel = &matmul_kernels[matmul_kernels_count++];
+        if(matmul_kernels_count % GGML_RKNPU2_MAX_MATMUL_KERNELS == 0)
+            matmul_kernels_count = 0;
+        memset(kernel, 0, sizeof(ggml_rknpu2_matmul_kernel));
+
+        kernel->thread_idx = core_number;
+        kernel->info.M = m;
+        kernel->info.K = k;
+        kernel->info.N = n;
+        kernel->info.type = type;
+        kernel->info.B_layout = 1; // B use native layout (weight)
+        kernel->info.AC_layout = 1; // A and C use original layout (intermediate)
+
+        printf("Creating RKNPU2 matmul kernel: src0(%d, %d) x src1(%d, %d) = dst(%d, %d) %s\n", m, k, k, n, m, n, rknpu2_matmul_type_to_string(type));
+        printf("kernel->ctx: %p\n", &(kernel->ctx));
+        printf("kernel->info: %p\n", &(kernel->info));
+        printf("kernel->io_attr: %p\n", &(kernel->io_attr));
+
+        int ret = rknn_matmul_create(&(kernel->ctx), &(kernel->info), &(kernel->io_attr));
+        GGML_ASSERT(ret == 0);
+
+        if(core_number == 0)
+            rknn_matmul_set_core_mask(kernel->ctx, RKNN_NPU_CORE_0);
+        else if(core_number == 1)
+            rknn_matmul_set_core_mask(kernel->ctx, RKNN_NPU_CORE_1);
+        else if(core_number == 2)
+            rknn_matmul_set_core_mask(kernel->ctx, RKNN_NPU_CORE_2);
+
+        {
+            auto kernel_mem_create_time = std::chrono::high_resolution_clock::now();
+            kernel->A = rknn_create_mem(kernel->ctx, kernel->io_attr.A.size);
+            kernel->B = rknn_create_mem(kernel->ctx, kernel->io_attr.B.size);
+            kernel->C = rknn_create_mem(kernel->ctx, kernel->io_attr.C.size);
+            auto kernel_mem_create_time_end = std::chrono::high_resolution_clock::now();   
+            auto kernel_mem_create_duration = std::chrono::duration_cast<std::chrono::microseconds>(kernel_mem_create_time_end - kernel_mem_create_time).count();
+            printf("kernel_mem_create_duration: %ld us\n", kernel_mem_create_duration);
+
+        }
+    }
+
+    // printf("created\n");
+    // printf("Created RKNPU2 matmul kernel: src0(%d, %d) x src1(%d, %d) = dst(%d, %d) %s\n", m, k, k, n, m, n, rknpu2_matmul_type_to_string(type));
+
+    {
+        // kernel->A_data = (void*)A_data;
+        // kernel->B_data = (void*)B_data;
+        kernel->A_size = A_size;
+        kernel->B_size = B_size;
+    }
+
+    return kernel;
+}
+
+static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(int m, int k, int n, rknn_matmul_type type, rknpu2::float16 * A_data, rknpu2::float16 * B_data, size_t A_size, size_t B_size, int &initialized) {
+    return ggml_rknpu2_matmul_kernel_create(A_data, B_data, A_size, B_size, m,k,n,type,1, initialized);
+}
+
+void transposed_matrix_to_perf_layout(const void *src, void *dst, int32_t K, int32_t N, int32_t subK, int32_t subN)
+{
+    // subN = 16 subK = 32 on 3588
+    const void * start_point = src;
+    int dst_offset = 0;
+    for(int outer = 0; outer < N / subN; outer++){
+        for(int j = 0 ; j < K / subK; j++){
+            int start_offset = outer * subN * K + j * subK;
+            for(int i = 0 ; i < subN; i++){
+                memcpy((float16 *)dst + dst_offset, (float16 *)start_point + start_offset, subK * sizeof(float16));
+                dst_offset += subK;
+                start_offset += K;
+            }
+        }
+    }
+}
+
+
+static void process_range(
+    const float16* src, float16* dst, int K,
+    int start_outer, int end_outer,
+    int subK, int subN, int total_j)
+{
+    const int block_size = subN * total_j * subK; // 每个outer块的大小
+    
+    for (int outer = start_outer; outer < end_outer; ++outer) {
+        // 计算当前outer块的目标起始位置
+        float16* block_dst = dst + outer * block_size;
+        
+        // 源矩阵的起始行
+        const float16* outer_src = src + outer * subN * K;
+        
+        // 遍历j维度（K方向分块）
+        for (int j = 0; j < total_j; ++j) {
+            // 当前j块的起始位置
+            const float16* j_src = outer_src + j * subK;
+            
+            // 遍历subN行
+            for (int i = 0; i < subN; ++i) {
+                // 目标位置：block + j块偏移 + 行内偏移
+                float16* dst_pos = block_dst + (j * subN + i) * subK;
+                
+                // 源位置：当前outer块的i行，j列
+                const float16* src_pos = j_src + i * K;
+                
+                // 32个float16=64字节，正好一个cacheline
+                // static_assert(sizeof(float16)*32 == 64, "Cache line size mismatch");
+                memcpy(dst_pos, src_pos, subK * sizeof(float16));
+            }
+        }
+    }
+}
+
+void transposed_matrix_to_perf_layout_multi_threads(
+    const void* src, void* dst, 
+    int32_t K, int32_t N,
+    int32_t subK, int32_t subN) 
+{
+    const float16* src_ptr = static_cast<const float16*>(src);
+    float16* dst_ptr = static_cast<float16*>(dst);
+
+    const int total_outer = N / subN;  // 外层循环次数
+    const int total_j = K / subK;      // j方向分块数
+    
+    // 根据物理核心数设置线程数（建议4-6）
+    const int n_threads = 1; 
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+
+    // 计算每个线程处理的outer范围
+    const int min_blocks_per_thread = total_outer / n_threads;
+    const int remainder = total_outer % n_threads;
+
+    for (int t = 0; t < n_threads; ++t) {
+        // 带余数的均衡分配
+        const int start_outer = t * min_blocks_per_thread + std::min(t, remainder);
+        const int end_outer = start_outer + min_blocks_per_thread + (t < remainder ? 1 : 0);
+
+        threads.emplace_back([=]() {
+            process_range(
+                src_ptr, dst_ptr, K,
+                start_outer, end_outer,
+                subK, subN, total_j
+            );
+        });
+    }
+
+    for (auto& th : threads) {
+        th.join();
+    }
+}
+
+void matrix_B_to_perf_layout_single_thread(
+    int total_outer, int total_j, int subN, int subK, int K,
+    float16* dst, const float16* src,
+    int thread_id, int num_threads)
+{
+    const int blocks_per_thread = (total_outer + num_threads - 1) / num_threads;
+    const int start_outer = thread_id * blocks_per_thread;
+    const int end_outer = std::min((thread_id + 1) * blocks_per_thread, total_outer);
+    
+    int dst_offset = start_outer * subN * (K / subK) * subK;
+    
+    for (int outer = start_outer; outer < end_outer; ++outer) {
+        for (int j = 0; j < total_j; ++j) {
+            const int src_offset = outer * subN * K + j * subK;
+            for (int i = 0; i < subN; ++i) {
+                const int src_pos = src_offset + i * K;
+                const int dst_pos = dst_offset + (j * subN + i) * subK;
+                memcpy(&dst[dst_pos], &src[src_pos], subK * sizeof(float16));
+            }
+        }
+        dst_offset += subN * total_j * subK; // 移动到下一个连续区域
+    }
+}
+// void matrix_B_to_perf_layout_single_thread(int total_blocks_outer, int total_blocks_j, int32_t subN, int32_t subK, int32_t K, float16 *__restrict__ dst_ptr, const float16 *start_point, int thread_idx, const int total_threads)
+// {
+//     int outer_begin = thread_idx * (total_blocks_outer / total_threads);
+//     int outer_end = (thread_idx + 1) * (total_blocks_outer / total_threads);
+//     // for (int outer = 0; outer < total_blocks_outer; outer++)
+//     for (int outer = outer_begin; outer < outer_end; outer++)
+//     {
+//         for (int j = 0; j < total_blocks_j; j++)
+//         {
+//             int local_offset = (outer * total_blocks_j + j) * subN * subK;
+//             int start_offset = outer * subN * K + j * subK;
+//             for (int i = 0; i < subN; i++)
+//             {
+//                 // printf("Thread %d dst_ptr = %p\n", thread_idx, dst_ptr + local_offset);
+//                 memcpy(dst_ptr + local_offset + i * subK,
+//                        start_point + start_offset,
+//                        subK * sizeof(float16));
+//                 start_offset += K;
+//             }
+//         }
+//     }
+// }
+void perf_matrixC_to_norm_layout(void *src, void *&dst, int32_t M, int32_t N){
+    if(M == 1){
+        dst = src;
+        return;
+    }
+
+    const int mem_unit = 4;
+    int dst_offset = 0;
+    for(int i = 0; i < M; i++){
+        for(int outer = 0; outer < N / mem_unit ; outer++){
+            memcpy((float*)dst + dst_offset, (float*)src + outer * mem_unit * M + i * mem_unit, mem_unit * sizeof(float));
+            dst_offset += mem_unit;
+        }
+    }
+}
+void matrixA_to_perf_layout(const void* src, void *&dst, int32_t M, int32_t K){
+    dst = malloc(M * K * sizeof(float16));
+    const int mem_unit = 8;
+    int dst_offset = 0;
+    for(int outer = 0; outer < K / mem_unit ; outer++){
+        for(int i = 0; i < M; i++){
+            int src_offset = outer * mem_unit + i *K;
+            memcpy((float16 *)dst + dst_offset, (float16 *)src + src_offset, mem_unit * sizeof(float16));
+            dst_offset += mem_unit;
+        }
+    }
+}
+
+void perf_matrixC_to_norm_transposed_layout(void *src, void *&dst, int32_t M, int32_t N){
+    if(M == 1){
+        dst = src;
+        return;
+    }
+    const int mem_unit = 4;
+    int dst_offset = 0;
+    for(int outer = 0; outer < N / mem_unit ; outer++){
+        for(int j = 0 ; j < mem_unit; j++){
+            for(int i = 0; i < M; i++){
+                ((float*)dst)[dst_offset] = ((float*) src)[outer * M * mem_unit + i * mem_unit + j];
+                // printf("dst_offset: %d, src_offset: %d, dst: %5.f, src: %5.f\n", dst_offset, outer * M * mem_unit + i * mem_unit + j, ((float*)dst)[dst_offset], ((float*) src)[outer * M * mem_unit + i * mem_unit + j]);
+                dst_offset++;
+            }
+        }
+    }
+}
+
+bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor);
+// prototypes
+rknn_tensor_type ggml_type_to_rknn_type(ggml_type type);
+rknn_tensor_type rknpu2_matmul_type_to_rknn_type_input(rknn_matmul_type type);
+rknn_tensor_type rknpu2_matmul_input_type_to_output_type(rknn_tensor_type type);
+rknn_matmul_type rknpu2_matmul_type_from_rknn_type(rknn_tensor_type type);
+const char* rknpu2_matmul_type_to_string(rknn_matmul_type type);
+const char* rknpu2_tensor_type_to_string(rknn_tensor_type type);
+size_t get_type_size(rknn_matmul_type type);
+void dequantize_row_q8_0(const block_q8_0 * x, float * y, int64_t k) ;
+
+void compute_submat_mul(int64_t m, int64_t k, const void * A_data, void * B_data, ggml_tensor * dst, int64_t row_start, int64_t row_end, int thread_idx, rknn_matmul_type type, const ggml_tensor * src0, const ggml_tensor * src1) ;
+
+
+struct ggml_backend_rknn_context {
+    int n_threads = 1;
+};
+
+
 // rknn tensor type -> rknn matmul type
 rknn_matmul_type rknpu2_matmul_type_from_rknn_type(rknn_tensor_type type)
 {
@@ -128,19 +494,7 @@ rknn_matmul_type rknpu2_matmul_type_from_rknn_type(rknn_tensor_type type)
 }
 
 // rknn matmul type -> string
-const char* rknpu2_matmul_type_to_string(rknn_matmul_type type)
-{
-    switch(type) {
-        case RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32:
-            return "FLOAT16_MM_FLOAT16_TO_FLOAT32";
-        case RKNN_INT8_MM_INT8_TO_INT32:
-            return "INT8_MM_INT8_TO_INT32";
-        case RKNN_INT4_MM_INT4_TO_INT16:
-            return "INT4_MM_INT4_TO_INT16";
-        default:
-            GGML_ASSERT(0);
-    }
-}
+
 
 // rknn tensor type -> string
 const char* rknpu2_tensor_type_to_string(rknn_tensor_type type)
@@ -315,7 +669,7 @@ static void ggml_backend_rknn_device_get_memory(ggml_backend_dev_t dev, size_t *
         *free = *free * info.mem_unit;
         *total = *total * info.mem_unit;
     } else {
-        std::cerr << "sysinfo failed" << "\n";
+        std::cout<< "sysinfo failed" << "\n";
     }
 
     GGML_UNUSED(dev);
@@ -509,6 +863,8 @@ bool ggml_backend_is_rknn(ggml_backend_t backend){
     return backend != NULL && ggml_guid_matches(backend -> guid, ggml_backend_rknn_guid());
 }
 
+// MARK: rknn backend INIT
+
 ggml_backend_t ggml_backend_rknn_init(void) {
     printf("@ggml-rknn.cpp\n");
     printf("start rknn init!\n");
@@ -516,6 +872,55 @@ ggml_backend_t ggml_backend_rknn_init(void) {
     printf("register the rknn!\n");
     ggml_backend_rknn_context * context = (ggml_backend_rknn_context *) malloc(sizeof(ggml_backend_rknn_context));
     printf("creating the backend!\n");
+
+    
+    std::vector<matrixPair> matrix_pairs;
+    bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/deepseek-r1-qwen2-1.5B.json", matrix_pairs);
+    if(!status){
+        printf("read shape pairs from json failed!\n");
+        return NULL;
+    }
+
+    for(matrixPair &matrix_pair : matrix_pairs){
+        printf("matrix_pair: (%d, %d), (%d, %d)\n", matrix_pair.src0.row, matrix_pair.src0.col, matrix_pair.src1.row, matrix_pair.src1.col);
+        matrix_ctx A = {matrix_pair.src0.row, matrix_pair.src0.col, NULL, "A"};
+        matrix_ctx B = {matrix_pair.src1.row, matrix_pair.src1.col, NULL, "B"};
+        size_t matrix_A_size = A.row * A.col * sizeof(float16);
+        size_t matrix_B_size = B.row * B.col * sizeof(float16);
+        int initialized = 0;
+        ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
+            A.data, 
+            B.data, 
+            matrix_A_size, 
+            matrix_B_size, 
+            A.row, 
+            A.col, 
+            B.col, 
+            RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
+            context->n_threads, 
+            initialized);
+    }
+    
+    // matrix_ctx A = {1, 1536, NULL, "A"};
+    // matrix_ctx B = {1536, 151936, NULL, "B"};
+
+    // size_t matrix_A_size = A.row * A.col * sizeof(float16);
+    // size_t matrix_B_size = B.row * B.col * sizeof(float16);
+
+    // int initialized = 0;
+
+    // ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
+    //     A.data, 
+    //     B.data, 
+    //     matrix_A_size, 
+    //     matrix_B_size, 
+    //     A.row, 
+    //     A.col, 
+    //     B.col, 
+    //     RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
+    //     context->n_threads, 
+    //     initialized);
+
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */  ggml_backend_rknn_guid(),
@@ -541,6 +946,7 @@ static bool ggml_rk_can_mul_mat(const struct ggml_tensor * src0, const struct gg
     // printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, ne0: %d, ne1: %d\n", (int)ne00, (int)ne01, (int)ne10, (int)ne11, (int)ne0, (int)ne1);
     //ne00: 960, ne01: 1, ne10: 960, ne11: 2880, ne0: 1, ne1: 2880
 
+
     // if(ne00 %32 != 0 || ne11%32 != 0){
     //     return false;
     // }
@@ -557,115 +963,20 @@ static bool ggml_rk_can_mul_mat(const struct ggml_tensor * src0, const struct gg
     //         (ne0 >= 1 && ne1 >= 1 && ne10 >= 1);
     //         //(ne0 >= 32 && ne1 >= 32 && ne10 >= 32);
     return true;
+
 }
 
 
 // static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(int m, int k, int n, rknn_matmul_type type, int thread_idx, rknpu2::float16 * A_data, rknpu2::float16 * B_data, size_t A_size, size_t B_size) {
-static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(int m, int k, int n, rknn_matmul_type type, int thread_idx, const void * A_data, void * B_data, size_t A_size, size_t B_size) {
-  for (int i = 0; i < matmul_kernels_count; i++) {
-    ggml_rknpu2_matmul_kernel *kernel = &matmul_kernels[i];
-    if (
-            kernel->info.M == m &&
-            kernel->info.K == k &&
-            kernel->info.N == n &&
-            kernel->is_using == false &&
-            // kernel->thread_idx == thread_idx &&
-            kernel->info.type == type 
-            // kernel->A_data == A_data &&
-            // kernel->B_data == B_data &&
-            // kernel->A_size == A_size &&
-            // kernel->B_size == B_size
-        )
-      return kernel;
-  }
-  return NULL;
-}
+
 
 
 
 
 // static ggml_rknpu2_matmul_kernel* ggml_rknpu2_matmul_kernel_create(rknpu2::float16* A_data, rknpu2::float16* B_data, size_t A_size, size_t B_size, int m, int k, int n, rknn_matmul_type type, int core_number, int &initialized){
-static ggml_rknpu2_matmul_kernel* ggml_rknpu2_matmul_kernel_create(const void* A_data, void* B_data, size_t A_size, size_t B_size, int m, int k, int n, rknn_matmul_type type, int core_number, int &initialized){
-    ggml_rknpu2_matmul_kernel* kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, type, core_number, A_data, B_data, A_size, B_size);
-    if(kernel != NULL){
-        // printf("find an existed kernel!\n");
-        // initialized = 1;
-        // return kernel;
-    }
 
-    else{
-        printf("Creating Kernel inside the function\n");
-        printf("parameters: %d, %d, %d, %d\n", m, k, n, type);
-        GGML_ASSERT(matmul_kernels_count < GGML_RKNPU2_MAX_MATMUL_KERNELS);
 
-        kernel = &matmul_kernels[matmul_kernels_count++];
-        if(matmul_kernels_count % GGML_RKNPU2_MAX_MATMUL_KERNELS == 0)
-            matmul_kernels_count = 0;
-        memset(kernel, 0, sizeof(ggml_rknpu2_matmul_kernel));
 
-        kernel->thread_idx = core_number;
-        kernel->info.M = m;
-        kernel->info.K = k;
-        kernel->info.N = n;
-        kernel->info.type = type;
-        kernel->info.B_layout = 0; // B use native layout (weight)
-        kernel->info.AC_layout = 0; // A and C use original layout (intermediate)
-
-        printf("Creating RKNPU2 matmul kernel: src0(%d, %d) x src1(%d, %d) = dst(%d, %d) %s\n", m, k, k, n, m, n, rknpu2_matmul_type_to_string(type));
-        printf("kernel->ctx: %p\n", &(kernel->ctx));
-        printf("kernel->info: %p\n", &(kernel->info));
-        printf("kernel->io_attr: %p\n", &(kernel->io_attr));
-
-        int ret = rknn_matmul_create(&(kernel->ctx), &(kernel->info), &(kernel->io_attr));
-        GGML_ASSERT(ret == 0);
-        {
-            auto kernel_mem_create_time = std::chrono::high_resolution_clock::now();
-            kernel->A = rknn_create_mem(kernel->ctx, kernel->io_attr.A.size);
-            kernel->B = rknn_create_mem(kernel->ctx, kernel->io_attr.B.size);
-            kernel->C = rknn_create_mem(kernel->ctx, kernel->io_attr.C.size);
-            auto kernel_mem_create_time_end = std::chrono::high_resolution_clock::now();   
-            auto kernel_mem_create_duration = std::chrono::duration_cast<std::chrono::microseconds>(kernel_mem_create_time_end - kernel_mem_create_time).count();
-            printf("kernel_mem_create_duration: %ld us\n", kernel_mem_create_duration);
-
-        }
-    }
-
-    // printf("created\n");
-    if(core_number == 0)
-        rknn_matmul_set_core_mask(kernel->ctx, RKNN_NPU_CORE_0);
-    else if(core_number == 1)
-        rknn_matmul_set_core_mask(kernel->ctx, RKNN_NPU_CORE_1);
-    else if(core_number == 2)
-        rknn_matmul_set_core_mask(kernel->ctx, RKNN_NPU_CORE_2);
-
-    // printf("Created RKNPU2 matmul kernel: src0(%d, %d) x src1(%d, %d) = dst(%d, %d) %s\n", m, k, k, n, m, n, rknpu2_matmul_type_to_string(type));
-
-    // create memory for A, B, C
-    // but need to memcpy to Matrix->virt_addr
-    // {
-    //     auto kernel_mem_create_time = std::chrono::high_resolution_clock::now();
-    //     kernel->A = rknn_create_mem(kernel->ctx, kernel->io_attr.A.size);
-    //     kernel->B = rknn_create_mem(kernel->ctx, kernel->io_attr.B.size);
-    //     kernel->C = rknn_create_mem(kernel->ctx, kernel->io_attr.C.size);
-    //     auto kernel_mem_create_time_end = std::chrono::high_resolution_clock::now();   
-    //     auto kernel_mem_create_duration = std::chrono::duration_cast<std::chrono::microseconds>(kernel_mem_create_time_end - kernel_mem_create_time).count();
-    //     printf("kernel_mem_create_duration: %ld us\n", kernel_mem_create_duration);
-
-    // }
-
-    {
-        kernel->A_data = (void*)A_data;
-        kernel->B_data = (void*)B_data;
-        kernel->A_size = A_size;
-        kernel->B_size = B_size;
-    }
-
-    return kernel;
-}
-
-static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(int m, int k, int n, rknn_matmul_type type, rknpu2::float16 * A_data, rknpu2::float16 * B_data, size_t A_size, size_t B_size, int &initialized) {
-    return ggml_rknpu2_matmul_kernel_create(A_data, B_data, A_size, B_size, m,k,n,type,1, initialized);
-}
 
 struct ggml_rknn_data_pack{
     rknn_tensor_type type;
@@ -674,6 +985,7 @@ struct ggml_rknn_data_pack{
 
     rknn_tensor_mem* B;
 };
+
 
 void copy_submatrix_A(bool is_last,
                     int A_block_row,
@@ -736,6 +1048,16 @@ void copy_submatrix_B(bool is_last,
 }
 
 
+size_t get_type_size(rknn_matmul_type type){
+    switch(type){
+        case RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32:
+            return sizeof(rknpu2::float16);
+        case RKNN_INT8_MM_INT8_TO_INT32:
+            return sizeof(int8_t);
+        default:
+            GGML_ASSERT(0);
+    }
+}
 
 void debug_A_block_start_B_block_start_data(int A_row_cnt,
                                             int B_row_ele_cnt,
@@ -768,6 +1090,8 @@ void debug_A_block_start_B_block_start_data(int A_row_cnt,
     }
     // copy the data to the new matrix
     // use memcpy to save time
+
+
 
     printf("sub_A_data:\n");
     for(int i = 0; i < A_row_cnt; i++){
@@ -817,88 +1141,384 @@ void debug_C_block(void * C_block,
         printf("\n");
     }
 }
+
+void dump_time_usage(double prepare_data_time, in_kernel_time &kernel_time, double total_run_time);
+void dump_matrix_shape(const int64_t A_row_00, const int64_t A_col_00, const int64_t A_row_01, const int64_t A_col_01, const int64_t A_row_10, const int64_t A_col_10, const int64_t A_row_11, const int64_t A_col_11, const int64_t B_row_00, const int64_t B_col_00, const int64_t B_row_01, const int64_t B_col_01, const int64_t B_row_10, const int64_t B_col_10, const int64_t B_row_11, const int64_t B_col_11);
+void second_split(int64_t dst_n, int64_t m, int64_t k, const void *A_data, int64_t ori_k, void *B_data, rknn_matmul_type type, int thread_idx, ggml_tensor *dst);
+void naive_split(int64_t row_end, int64_t row_start, int64_t m, int64_t k, const void *A_data, void *B_data, rknn_matmul_type type, int thread_idx, int64_t dst_n, ggml_tensor *dst);
+void side_matrix_mulmat_process(void *pad_A00, void *pad_B00, int &C_tile, const matrix_ctx &A00_ctx, const matrix_ctx &B00_ctx, rknn_matmul_type type, int thread_idx, ggml_tensor *dst, int64_t n, in_kernel_time &kernel_time, int id, int offset_col, int offset_row);
+void side_matrix_mulmat_process(void *pad_A00, void *pad_B00, int &C_tile, const matrix_ctx &A00_ctx, const matrix_ctx &B00_ctx, rknn_matmul_type type, int thread_idx, ggml_tensor *dst, int64_t n, in_kernel_time &kernel_time, int id, int offset_col, int offset_row, bool matrix_B00_need_set_io);
+
+// MARK: Matmul
+
+
 void compute_submat_mul(int64_t m, // matrix A row
                         int64_t k, // matrix B row
-                        const void * A_data,
-                        void * B_data,
-                        ggml_tensor * dst,
+                        void *A_data,
+                        void *B_data,
+                        ggml_tensor *dst,
                         int64_t row_start,
                         int64_t row_end,
                         int thread_idx,
                         rknn_matmul_type type,
                         int64_t dst_n,
-                        int64_t ori_k) {
+                        int64_t ori_k,
+                        ggml_tensor *src0,
+                        ggml_tensor *src1)
+{
     bool split_matrix= false;
-    bool second_split = false;
+    bool second_split_flag = false;
     if(split_matrix) {
-        printf("partition B\n");
+        naive_split(row_end, row_start, m, k, A_data, B_data, type, thread_idx, dst_n, dst);
+    }else if(second_split_flag){
+        second_split(dst_n, m, k, A_data, ori_k, B_data, type, thread_idx, dst);
+    }
+    else{
+        // int64_t m = m;
+        int64_t n = dst_n;
+        int64_t k = ori_k;
 
-        // columns of the sub_matrix of B
-        int64_t sub_n = row_end - row_start;
-        size_t A_size = m * k * sizeof(rknpu2::float16);
-        size_t B_size = sub_n * k * sizeof(rknpu2::float16);
+        // printf("m: %d, k: %d, n: %d\n",  (int)m, (int)k, (int)n);
+        memset(dst->data, 0, m * n * sizeof(float));
 
-        printf("m: %d, k: %d, sub_n: %d\n",  (int)m, (int)k, (int)sub_n);
-    
-        int initialized = 0;
-        // measure the overhead of creating the kernel
-        auto start = std::chrono::high_resolution_clock::now();
-        ggml_rknpu2_matmul_kernel* sub_kernel = ggml_rknpu2_matmul_kernel_create(A_data, B_data, A_size, B_size, m, k, sub_n, type, thread_idx, initialized);
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        printf("kernel creation time: %lld\n", duration.count());
+        // >>>>>>>>>>>>>>>Debug>>>>>>>>>>>>>>>.
+        // check_A_B_data(m, k, A_data, n, B_data);
+        // <<<<<<<<<<<<<<<<<<<<<done<<<<<<<<<<<<<<<<<<<<<<<<<
 
-        // sub_kernel->is_using = true;
-        
-        printf("m*k = %d, k*sub_n = %d\n", (int)(m * k), (int)(k * sub_n));
-        start = std::chrono::high_resolution_clock::now();
-        if(initialized == 0){
-            memcpy(sub_kernel->A->virt_addr, A_data, m * k * sizeof(rknpu2::float16));
-            memcpy(sub_kernel->B->virt_addr, B_data, sub_n * k * sizeof(rknpu2::float16));
+        // const int64_t A_row_00 = m / 32 * 32;
+        const int64_t A_row_00 = m;
+        const int64_t A_row_01 = A_row_00;
+        // const int64_t A_row_10 = m - A_row_00;
+        // const int64_t A_row_11 = A_row_10;
+
+        const int64_t A_col_00 = k / 32 * 32;
+        const int64_t A_col_01 = k - A_col_00;
+        // const int64_t A_col_10 = A_col_00;
+        // const int64_t A_col_11 = A_col_01;
+
+        const int64_t B_row_00 = k / 32 * 32;
+        const int64_t B_row_01 = B_row_00;
+        const int64_t B_row_10 = k - B_row_00;
+        const int64_t B_row_11 = B_row_10;
+
+        const int64_t B_col_00 = n / 32 * 32;
+        const int64_t B_col_01 = n - B_col_00;
+        const int64_t B_col_10 = B_col_00;
+        const int64_t B_col_11 = B_col_01;
+
+        // dump_matrix_shape(A_row_00, A_col_00, A_row_01, A_col_01, A_row_10, A_col_10, A_row_11, A_col_11, B_row_00, B_col_00, B_row_01, B_col_01, B_row_10, B_col_10, B_row_11, B_col_11);
+        // pad A01, A10, A11, B01, B10, B11
+
+        double prepare_data_time = 0; 
+        double total_run_time = 0;
+        in_kernel_time kernel_time;
+        memset(&kernel_time, 0, sizeof(in_kernel_time));
+
+        auto total_run_start = std::chrono::high_resolution_clock::now();
+
+        void * pad_A00 = nullptr; int fixed_A00 = 0;
+        void * pad_A01 = nullptr;
+        void * pad_A10 = nullptr;
+        void * pad_A11 = nullptr;
+        void * pad_B00 = nullptr; int fixed_B00 = 0;
+        void * pad_B01 = nullptr;
+        void * pad_B10 = nullptr;
+        void * pad_B11 = nullptr;
+
+        auto prepare_data_start = std::chrono::high_resolution_clock::now();
+        bool mat_A_mat_B_in_kernel = false;
+
+        matrix_ctx A_ctx = {A_row_00, A_col_00, pad_A00, "A"};
+        matrix_ctx B_ctx = {B_row_00, B_col_00, pad_B00, "B"};
+
+
+        ggml_rknpu2_matmul_kernel * tmp_kernel = ggml_rknpu2_matmul_kernel_find(A_ctx, B_ctx, type, thread_idx);
+
+        if(tmp_kernel != NULL) mat_A_mat_B_in_kernel = true;
+        printf("mat_A_mat_B_in_kernel: %d\n", mat_A_mat_B_in_kernel);   
+
+
+        if(A_row_00 != 0 && A_col_00 != 0){
+
+            // if(A_row_10 == 0 && A_col_11 == 0){
+            //     auto prepare_A_data_start = std::chrono::high_resolution_clock::now();
+            //     pad_A00 = A_data;
+            //     // pad_A00 = matmul_kernels[0].A->virt_addr;
+            //     fixed_A00 = 1;
+            //     auto prepare_A_data_end = std::chrono::high_resolution_clock::now();
+            //     auto prepare_A_data_duration = std::chrono::duration_cast<std::chrono::microseconds>(prepare_A_data_end - prepare_A_data_start);
+            //     printf("prepare_A_data_duration: %ld us\n", prepare_A_data_duration.count());
+            // }
+            // else{
+                // pad_A00 = malloc(A_row_00 * A_col_00 * sizeof(rknpu2::float16));
+                matrixA_to_perf_layout(A_data, pad_A00, A_row_00, A_col_00);
+
+
+            // }
         }
-        end = std::chrono::high_resolution_clock::now();
-        duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        printf("memcpy time: %lld\n", duration.count());
 
-        if(initialized == 0){
-            rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->A, &sub_kernel->io_attr.A);
-            rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->B, &sub_kernel->io_attr.B);
-            rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->C, &sub_kernel->io_attr.C);
-        }
+        bool matrix_B00_need_set_io = true;
+        if(B_row_00 != 0 && B_col_00 != 0){
 
-        start = std::chrono::high_resolution_clock::now();
-        int ret = rknn_matmul_run(sub_kernel->ctx);
-        end = std::chrono::high_resolution_clock::now();
-        duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        printf("run time: %lld\n", duration.count());
-
-        GGML_ASSERT(ret == 0);
-
-        // print the result of sub_kernel
-        printf("result of sub_kernel:\n");
-        for(int i = 0 ; i < sub_n; i++){
-            for(int j = 0 ; j < m; j++){
-                printf("%4.f ", ((float*)sub_kernel->C->virt_addr)[i * m + j]);
+            // pad_B00 = malloc(B_row_00 * B_col_00 * sizeof(rknpu2::float16));
+            if(mat_A_mat_B_in_kernel){
+                // check if the it has been initialized
+                // in matmul_kernel all B_data should has been converted to perf_layout
+                printf("tmp_kernel->B_data: %p, src1->data: %p\n", tmp_kernel->B_data, src1->data);
+                if(tmp_kernel->B_data == src1->data){
+                    // yes mat_B has been converted
+                    pad_B00 = src1->extra;
+                    matrix_B00_need_set_io = false;
+                }else{
+                    // mat_B has not been converted
+                    if(src1->extra != NULL){
+                        // check if the it has been initialized
+                        pad_B00 = src1->extra;
+                    }else{
+                        // not initialized
+                        pad_B00 = tmp_kernel->B->virt_addr;
+                        transposed_matrix_to_perf_layout_multi_threads(B_data, pad_B00, B_row_00, B_col_00, 32, 16);
+                        src1->extra = malloc(B_row_00 * B_col_00 * sizeof(rknpu2::float16));
+                        memcpy(src1->extra, pad_B00, B_row_00 * B_col_00 * sizeof(rknpu2::float16));
+                    }
+                    tmp_kernel->B_data = src1->data;
+                }
+            }else{
+                // pad_B00 = matmul_kernels[0].B->virt_addr;
+                pad_B00 = malloc(B_row_00 * B_col_00 * sizeof(rknpu2::float16));
+                auto single_thread_start = std::chrono::high_resolution_clock::now();
+                // transposed_matrix_to_perf_layout(B_data, pad_B00, B_row_00, B_col_00, 32, 16);
+                transposed_matrix_to_perf_layout_multi_threads(B_data, pad_B00, B_row_00, B_col_00, 32, 16);
+                auto single_thread_end = std::chrono::high_resolution_clock::now();
+                auto single_thread_duration = std::chrono::duration_cast<std::chrono::microseconds>(single_thread_end - single_thread_start);
+                printf("single_thread_duration: %ld us\n", single_thread_duration.count());
             }
-            printf("\n");
+       }
+        
+        // take A01 as an example
+        // TODO: Abstract the code
+        // process A01
+        pad_side_matrix(A_row_01, A_col_01, A_data, A_row_00, k, pad_A01, A_col_00);
+        
+        bool is_A = true;
+        // if(A_row_10 != 0 && A_col_10 != 0){
+        //     void * A10_start = (rknpu2::float16*)A_data + A_row_00 * k;
+        //     pad_A10 = pad_sub_matrix(A_row_10, A_col_10, 0, A10_start, k, is_A);
+        //     // printf("pad_A10:\n");
+        //     // check_pad(32, A_col_10, pad_A10);
+        // }
+
+        // if(A_row_11 != 0 && A_col_11 != 0){
+        //     void * A11_start = (rknpu2::float16*)A_data + A_row_00 * k;
+        //     pad_A11 = pad_sub_matrix(A_row_11, A_col_11, A_col_10, A11_start, k, is_A);
+        //     // printf("pad_A11: \n");
+        //     // check_pad(32,32,pad_A11);
+        // }
+
+        if(B_row_01 != 0 && B_col_01 != 0){
+            void * B01_start = (rknpu2::float16*)B_data + B_row_00 * n;
+            // pad_B01 = pad_sub_matrix(B_row_01, B_col_01, B_col_00, B_data, n, false);
+            void * tmp_ptr = pad_sub_matrix(B_row_01, B_col_01, B_col_00, B_data, n, false);
+            int pad_row = B_row_01 < 32 ? 32 : B_row_01 /32 * 32;
+            int pad_col = B_col_01 < 32 ? 32 : B_col_01 /32 * 32;
+            pad_B01 = malloc(pad_row * pad_col * sizeof(rknpu2::float16));
+            transposed_matrix_to_perf_layout_multi_threads(tmp_ptr, pad_B01, pad_row, pad_col, 32, 16);
+            // printf("pad_B01:\n");
+            // check_pad(B_row_01, 32, pad_B01);
+        }
+
+        if(B_row_10 != 0 && B_col_10 != 0){
+            void * B10_start = (rknpu2::float16*)B_data + B_row_00 * n;
+            // pad_B10 = pad_sub_matrix(B_row_10, B_col_10, 0, B10_start, n, false);
+            void * tmp_ptr = pad_sub_matrix(B_row_10, B_col_10, 0, B_data, n, false);
+            int pad_row = B_row_10 < 32 ? 32 : B_row_10 /32 * 32;
+            int pad_col = B_col_10 < 32 ? 32 : B_col_10 /32 * 32;
+            pad_B10 = malloc(pad_row * pad_col * sizeof(rknpu2::float16));
+            transposed_matrix_to_perf_layout_multi_threads(tmp_ptr, pad_B10, pad_row, pad_col, 32, 16);
+            // printf("pad_B10:\n");
+            // check_pad(32, B_col_10, pad_B10);
+        }
+
+        if(B_row_11 != 0 && B_col_11 != 0){
+            void * B11_start = (rknpu2::float16*)B_data + B_row_00 * n;
+            // pad_B11 = pad_sub_matrix(B_row_11, B_col_11, B_col_10, B11_start, n, false);
+            void * tmp_ptr = pad_sub_matrix(B_row_11, B_col_11, B_col_10, B_data, n, false);
+            int pad_row = B_row_11 < 32 ? 32 : B_row_11 /32 * 32;
+            int pad_col = B_col_11 < 32 ? 32 : B_col_11 /32 * 32;
+            pad_B11 = malloc(pad_row * pad_col * sizeof(rknpu2::float16));
+            transposed_matrix_to_perf_layout_multi_threads(tmp_ptr, pad_B11, pad_row, pad_col, 32, 16);
+            // printf("pad_B11:\n");
+            // check_pad(32, 32, pad_B11);
+        }
+
+        auto prepare_data_end = std::chrono::high_resolution_clock::now();
+        auto prepare_data_duration = std::chrono::duration_cast<std::chrono::microseconds>(prepare_data_end - prepare_data_start);
+        prepare_data_time = prepare_data_duration.count();
+
+        matrix_ctx A00_ctx = {A_row_00, A_col_00, pad_A00, "A00"};
+        matrix_ctx A01_ctx = {A_row_01, A_col_01, pad_A01, "A01"};
+        // matrix_ctx A10_ctx = {A_row_10, A_col_10, pad_A10, "A10"};
+        // matrix_ctx A11_ctx = {A_row_11, A_col_11, pad_A11, "A11"};
+        matrix_ctx B00_ctx = {B_row_00, B_col_00, pad_B00, "B00"};
+        matrix_ctx B01_ctx = {B_row_01, B_col_01, pad_B01, "B01"};
+        matrix_ctx B10_ctx = {B_row_10, B_col_10, pad_B10, "B10"};
+        matrix_ctx B11_ctx = {B_row_11, B_col_11, pad_B11, "B11"};
+
+        int C_tile = 0;
+        side_matrix_mulmat_process(pad_A00, pad_B00, C_tile, A00_ctx, B00_ctx, type, thread_idx, dst, n, kernel_time, 1, 0, 0, matrix_B00_need_set_io);
+        side_matrix_mulmat_process(pad_A01, pad_B10, C_tile, A01_ctx, B10_ctx, type, thread_idx, dst, n, kernel_time, 2, 0, 0);
+
+        C_tile = 1;
+        side_matrix_mulmat_process(pad_A00, pad_B01, C_tile, A00_ctx, B01_ctx, type, thread_idx, dst, n, kernel_time, 3, B_col_00, 0);
+        side_matrix_mulmat_process(pad_A01, pad_B11, C_tile, A01_ctx, B11_ctx, type, thread_idx, dst, n, kernel_time, 4, B_col_00, 0);
+
+        C_tile = 2;
+        // side_matrix_mulmat_process(pad_A10, pad_B00, C_tile, A10_ctx, B00_ctx, type, thread_idx, dst, n, kernel_time, 5, 0, A_row_00);
+        // side_matrix_mulmat_process(pad_A11, pad_B10, C_tile, A11_ctx, B10_ctx, type, thread_idx, dst, n, kernel_time, 6, 0, A_row_00);
+
+        C_tile = 3;
+        // side_matrix_mulmat_process(pad_A10, pad_B01, C_tile, A10_ctx, B01_ctx, type, thread_idx, dst, n, kernel_time, 7, B_col_00, A_row_00);
+        // side_matrix_mulmat_process(pad_A11, pad_B11, C_tile, A11_ctx, B11_ctx, type, thread_idx, dst, n, kernel_time, 8, B_col_00, A_row_00);
+        
+
+
+        auto total_run_end = std::chrono::high_resolution_clock::now();
+        auto total_run_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_run_end - total_run_start);
+        total_run_time = total_run_duration.count();
+
+
+        dump_time_usage(prepare_data_time, kernel_time, total_run_time);
+
+        if(pad_A00!= nullptr && fixed_A00 == 0)
+        {
+            // free(pad_A00);
+        }
+        if(pad_A01!= nullptr)
+        {
+            free(pad_A01);
+        }
+        // if(pad_A10!= nullptr)
+        // {
+        //     free(pad_A10);
+        // }
+        // if(pad_A11!= nullptr)
+        // {
+        //     free(pad_A11);
+        // }
+        if(pad_B00!= nullptr && fixed_B00 == 0)
+        {
+            // free(pad_B00);
+        }
+        if(pad_B01!= nullptr)
+        {
+            free(pad_B01);
+        }
+        if(pad_B10!= nullptr)
+        {
+            free(pad_B10);
+        }
+        if(pad_B11!= nullptr)
+        {
+            free(pad_B11);
+        }
+
+    }
+}
+
+
+void side_matrix_mulmat_process(void *pad_A00, void *pad_B00, int &C_tile, const matrix_ctx &A00_ctx, const matrix_ctx &B00_ctx, rknn_matmul_type type, int thread_idx, ggml_tensor *dst, int64_t n, in_kernel_time &kernel_time, int id, int offset_col, int offset_row, bool matrix_B00_need_set_io){
+    if (pad_A00 != nullptr && pad_B00 != nullptr)
+    {
+        double tmp_kernel_runtime = 0;
+        tmp_kernel_runtime = kernel_time.run_time;
+        side_matrix_multiplication(A00_ctx, B00_ctx, type, thread_idx, C_tile, dst, n, id, offset_col, offset_row, kernel_time, matrix_B00_need_set_io);
+        // printf("A_ctx: %s, B_ctx: %s, C_tile: %d\n", A00_ctx.name, B00_ctx.name, C_tile);
+        // printf("run time: %.lf\n", kernel_time.run_time - tmp_kernel_runtime);
+    }
+
+
+}
+void side_matrix_mulmat_process(void *pad_A00, void *pad_B00, int &C_tile, const matrix_ctx &A00_ctx, const matrix_ctx &B00_ctx, rknn_matmul_type type, int thread_idx, ggml_tensor *dst, int64_t n, in_kernel_time &kernel_time, int id, int offset_col, int offset_row) {
+    side_matrix_mulmat_process(pad_A00, pad_B00, C_tile, A00_ctx, B00_ctx, type, thread_idx, dst, n, kernel_time, id, offset_col, offset_row, true);
+}
+void naive_split(int64_t row_end, int64_t row_start, int64_t m, int64_t k, const void *A_data, void *B_data, rknn_matmul_type type, int thread_idx, int64_t dst_n, ggml_tensor *dst)
+{
+    printf("partition B\n");
+
+    // columns of the sub_matrix of B
+    int64_t sub_n = row_end - row_start;
+    size_t A_size = m * k * sizeof(rknpu2::float16);
+    size_t B_size = sub_n * k * sizeof(rknpu2::float16);
+
+    printf("m: %d, k: %d, sub_n: %d\n", (int)m, (int)k, (int)sub_n);
+
+    int initialized = 0;
+    // measure the overhead of creating the kernel
+    auto start = std::chrono::high_resolution_clock::now();
+    ggml_rknpu2_matmul_kernel *sub_kernel = ggml_rknpu2_matmul_kernel_create(A_data, B_data, A_size, B_size, m, k, sub_n, type, thread_idx, initialized);
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    printf("kernel creation time: %lld\n", duration.count());
+
+    // sub_kernel->is_using = true;
+
+    printf("m*k = %d, k*sub_n = %d\n", (int)(m * k), (int)(k * sub_n));
+    start = std::chrono::high_resolution_clock::now();
+    if (initialized == 0)
+    {
+        memcpy(sub_kernel->A->virt_addr, A_data, m * k * sizeof(rknpu2::float16));
+        memcpy(sub_kernel->B->virt_addr, B_data, sub_n * k * sizeof(rknpu2::float16));
+    }
+    end = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    printf("memcpy time: %lld\n", duration.count());
+
+    if (initialized == 0)
+    {
+        rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->A, &sub_kernel->io_attr.A);
+        rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->B, &sub_kernel->io_attr.B);
+        rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->C, &sub_kernel->io_attr.C);
+    }
+
+    start = std::chrono::high_resolution_clock::now();
+    int ret = rknn_matmul_run(sub_kernel->ctx);
+    end = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    printf("run time: %lld\n", duration.count());
+
+    GGML_ASSERT(ret == 0);
+
+    // print the result of sub_kernel
+    printf("result of sub_kernel:\n");
+    for (int i = 0; i < sub_n; i++)
+    {
+        for (int j = 0; j < m; j++)
+        {
+            printf("%4.f ", ((float *)sub_kernel->C->virt_addr)[i * m + j]);
         }
         printf("\n");
+    }
+    printf("\n");
 
-        start = std::chrono::high_resolution_clock::now();
+    start = std::chrono::high_resolution_clock::now();
 
-
-
-        // write back the result to dst
-        // need transposed
-        for(int i = 0 ; i < dst_n ; i++){ //row
-            for(int j = 0 ; j < m; j++){ //column
-                ((float *)dst->data)[i * m + j] = ((float*)sub_kernel->C->virt_addr)[j * sub_n + i];
-            }
+    // write back the result to dst
+    // need transposed
+    for (int i = 0; i < dst_n; i++)
+    { // row
+        for (int j = 0; j < m; j++)
+        { // column
+            ((float *)dst->data)[i * m + j] = ((float *)sub_kernel->C->virt_addr)[j * sub_n + i];
         }
-        end = std::chrono::high_resolution_clock::now();
-        duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        printf("write back time: %lld\n", duration.count());
-    }else if(second_split){
+    }
+    end = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    printf("write back time: %lld\n", duration.count());
+}
+
+void second_split(int64_t dst_n, int64_t m, int64_t k, const void *A_data, int64_t ori_k, void *B_data, rknn_matmul_type type, int thread_idx, ggml_tensor *dst)
+{
+    {
         // So now we have B^T x A^T = C^T
         // In the parameter of the function, A is the matrix B in the external program, B is matrix A in the external program
         // In such way, we can send them to the kernel directly, we don't need to transpose the matrix in this function.
@@ -918,50 +1538,50 @@ void compute_submat_mul(int64_t m, // matrix A row
         size_t A_size = m * k * sizeof(rknpu2::float16);
         size_t B_size = sub_n * k * sizeof(rknpu2::float16);
 
-        printf("m: %d, k: %d, sub_n: %d\n",  (int)m, (int)k, (int)sub_n);
+        printf("m: %d, k: %d, sub_n: %d\n", (int)m, (int)k, (int)sub_n);
 
-        const int A_block_column    = 32;
-        const int A_block_row       = 32;
-        const int A_block_ele_size  = A_block_column * A_block_row;
-        const int B_block_column    = 32;
-        const int B_block_row       = 32;
-        const int B_block_ele_size  = B_block_column * B_block_row;
-        const int C_block_column    = 32;
-        const int C_block_row       = 32;
-        const int C_block_ele_size  = C_block_column * C_block_row;
+        const int A_block_column = 32;
+        const int A_block_row = 32;
+        const int A_block_ele_size = A_block_column * A_block_row;
+        const int B_block_column = 32;
+        const int B_block_row = 32;
+        const int B_block_ele_size = B_block_column * B_block_row;
+        const int C_block_column = 32;
+        const int C_block_row = 32;
+        const int C_block_ele_size = C_block_column * C_block_row;
 
-        const int A_block_column_cnt    = (k - 1) / A_block_column + 1;
-        const int A_block_row_cnt       = (m - 1) / A_block_row + 1;
-        const int B_block_column_cnt    = (sub_n - 1) / B_block_column + 1;
-        const int B_block_row_cnt       = (k - 1) / B_block_row + 1;
+        const int A_block_column_cnt = (k - 1) / A_block_column + 1;
+        const int A_block_row_cnt = (m - 1) / A_block_row + 1;
+        const int B_block_column_cnt = (sub_n - 1) / B_block_column + 1;
+        const int B_block_row_cnt = (k - 1) / B_block_row + 1;
 
-        const int C_block_column_cnt    = B_block_column_cnt;
-        const int C_block_row_cnt       = A_block_row_cnt;
+        const int C_block_column_cnt = B_block_column_cnt;
+        const int C_block_row_cnt = A_block_row_cnt;
 
-        const int block_size            = A_block_ele_size * sizeof(rknpu2::float16);
+        const int block_size = A_block_ele_size * sizeof(rknpu2::float16);
 
         // prepare for the computation. alloc once and use multiple times
         auto calloc_C_start = std::chrono::high_resolution_clock::now();
-        void * C_data  = calloc(m * sub_n , sizeof(float)); //waiting
+        void *C_data = calloc(m * sub_n, sizeof(float)); // waiting
         auto calloc_C_end = std::chrono::high_resolution_clock::now();
         auto calloc_C_duration = std::chrono::duration_cast<std::chrono::microseconds>(calloc_C_end - calloc_C_start).count();
         // printf("calloc_C_duration: %lld\n", calloc_C_duration);
         create_mem_duration += calloc_C_duration;
-        
 
-        for(int C_row_block = 0; C_row_block < C_block_row_cnt; C_row_block++){
-            for(int C_column_block = 0; C_column_block < C_block_column_cnt; C_column_block++){
+        for (int C_row_block = 0; C_row_block < C_block_row_cnt; C_row_block++)
+        {
+            for (int C_column_block = 0; C_column_block < C_block_column_cnt; C_column_block++)
+            {
                 int A_row_cnt = A_block_row;
 
                 int A_last_block_row = m % A_block_row;
-                if(A_last_block_row == 0)
+                if (A_last_block_row == 0)
                     A_last_block_row = A_block_row;
-                if(C_row_block == C_block_row_cnt - 1)
+                if (C_row_block == C_block_row_cnt - 1)
                     A_row_cnt = A_last_block_row;
 
-                std::vector<float*> results(A_block_column_cnt, nullptr); 
-                std::vector<float*> results_float(A_block_column_cnt, nullptr); 
-
+                std::vector<float *> results(A_block_column_cnt, nullptr);
+                std::vector<float *> results_float(A_block_column_cnt, nullptr);
 
                 int A_row_ele_cnt = A_block_row;
                 int A_column_ele_cnt = A_block_column;
@@ -969,31 +1589,28 @@ void compute_submat_mul(int64_t m, // matrix A row
                 int B_row_ele_cnt = B_block_row;
                 int B_column_ele_cnt = B_block_column;
 
-                for(int A_column_block = 0; A_column_block < A_block_column_cnt; A_column_block++){
+                for (int A_column_block = 0; A_column_block < A_block_column_cnt; A_column_block++)
+                {
                     // printf("C_row_block: %d, C_column_block: %d, A_clolumn_block: %d \n", (int)C_row_block, (int)C_column_block, (int)A_column_block);
 
-                    void * sub_A_data = malloc(A_block_row * A_block_column * sizeof(rknpu2::float16)); //Released
-                    void * sub_B_data = malloc(B_block_row * B_block_column * sizeof(rknpu2::float16)); //Released
-                    int A_row_block     = C_row_block;
-                    int B_row_block     = A_column_block;
-                    int B_column_block  = C_column_block;
+                    void *sub_A_data = malloc(A_block_row * A_block_column * sizeof(rknpu2::float16)); // Released
+                    void *sub_B_data = malloc(B_block_row * B_block_column * sizeof(rknpu2::float16)); // Released
+                    int A_row_block = C_row_block;
+                    int B_row_block = A_column_block;
+                    int B_column_block = C_column_block;
 
-                    void * A_block_start;
-                    A_block_start = (void*)((rknpu2::float16*)A_data  // point starter
-                                            + A_row_block * ori_k * A_block_row  // row block offset
-                                            + A_column_block * A_block_column); // column block offset
-                    void * B_block_start;
-                    B_block_start = (void*)((rknpu2::float16*)B_data 
-                                            + B_row_block * sub_n * B_block_row 
-                                            + B_column_block * B_block_column);
+                    void *A_block_start;
+                    A_block_start = (void *)((rknpu2::float16 *)A_data           // point starter
+                                             + A_row_block * ori_k * A_block_row // row block offset
+                                             + A_column_block * A_block_column); // column block offset
+                    void *B_block_start;
+                    B_block_start = (void *)((rknpu2::float16 *)B_data + B_row_block * sub_n * B_block_row + B_column_block * B_block_column);
 
                     bool is_last = false;
 
                     copy_submatrix_A_process(A_row_block, A_block_row_cnt, A_row_ele_cnt, m, A_block_row, is_last, A_column_block, A_block_column_cnt, A_column_ele_cnt, ori_k, A_block_column, sub_A_data, A_block_start, A_row_cnt, memcpy_duration);
 
                     copy_submatrix_B_process(is_last, B_row_block, B_block_row_cnt, B_row_ele_cnt, ori_k, B_block_row, B_column_block, B_block_column_cnt, B_column_ele_cnt, sub_n, B_block_column, sub_B_data, B_block_start, memcpy_duration);
-
-
 
                     // >>>>>>>>>>>>>>>>>>>>>>>debug>>>>>>>>>>>>>>>>>>>>>>>
                     // debug_A_block_start_B_block_start_data(A_row_cnt, B_row_ele_cnt, B_column_ele_cnt, A_block_column, B_block_column, B_block_row, A_block_row, A_block_start, B_block_start, (rknpu2::float16*)sub_A_data, (rknpu2::float16*)sub_B_data, ori_k, sub_n);
@@ -1011,21 +1628,22 @@ void compute_submat_mul(int64_t m, // matrix A row
                         ////////////////////////////////////////////////////////////////////////
                     */
                     auto kernel_find_start = std::chrono::high_resolution_clock::now();
-                    ggml_rknpu2_matmul_kernel* sub_kernel = ggml_rknpu2_matmul_kernel_create(sub_A_data, sub_B_data, A_size, B_size, A_row_cnt, A_block_column, B_block_row, type, thread_idx, initialized);
+                    ggml_rknpu2_matmul_kernel *sub_kernel = ggml_rknpu2_matmul_kernel_create(sub_A_data, sub_B_data, A_size, B_size, A_row_cnt, A_block_column, B_block_row, type, thread_idx, initialized);
                     auto kernel_find_end = std::chrono::high_resolution_clock::now();
                     auto kernel_find_duration = std::chrono::duration_cast<std::chrono::microseconds>(kernel_find_end - kernel_find_start);
                     // printf("kernel creation time: %lld\n", kernel_find_duration.count());
                     kernel_duration += kernel_find_duration.count();
 
-                    if(initialized == 0){
-                    // printf("A_row_cnt: %d, A_block_column: %d \n", (int)A_row_cnt, (int)A_block_column);
-                    // printf("B_block_row: %d, B_block_column: %d \n", (int)B_block_row, (int)B_block_column);
+                    if (initialized == 0)
+                    {
+                        // printf("A_row_cnt: %d, A_block_column: %d \n", (int)A_row_cnt, (int)A_block_column);
+                        // printf("B_block_row: %d, B_block_column: %d \n", (int)B_block_row, (int)B_block_column);
                         /*
                             ////////////////////////////////////////////////////////////////////////
                             * Step 3:
                             * create A, B, C float data
                             ////////////////////////////////////////////////////////////////////////
-                        */                        
+                        */
                         /*
                             ////////////////////////////////////////////////////////////////////////
                             * Step 4:
@@ -1042,7 +1660,7 @@ void compute_submat_mul(int64_t m, // matrix A row
                         auto copy_to_mem_start = std::chrono::high_resolution_clock::now();
                         memcpy(sub_kernel->A->virt_addr, sub_A_data, A_row_cnt * A_block_column * sizeof(rknpu2::float16));
                         // printf("sub_kernel->A->virt_addr: %p\n", sub_kernel->A->virt_addr);
-                        memcpy(sub_kernel->B->virt_addr, sub_B_data, B_block_row* A_block_column * sizeof(rknpu2::float16));
+                        memcpy(sub_kernel->B->virt_addr, sub_B_data, B_block_row * A_block_column * sizeof(rknpu2::float16));
                         auto copy_to_mem_end = std::chrono::high_resolution_clock::now();
                         auto copy_to_mem_duration = std::chrono::duration_cast<std::chrono::microseconds>(copy_to_mem_end - copy_to_mem_start);
                         // printf("copy to mem time: %lld\n", copy_to_mem_duration.count());
@@ -1067,14 +1685,13 @@ void compute_submat_mul(int64_t m, // matrix A row
                     auto run_start = std::chrono::high_resolution_clock::now();
                     int ret = rknn_matmul_run(sub_kernel->ctx);
                     auto run_end = std::chrono::high_resolution_clock::now();
-                    auto r_duration = std::chrono::duration_cast<std::chrono::microseconds>(run_end- run_start);
+                    auto r_duration = std::chrono::duration_cast<std::chrono::microseconds>(run_end - run_start);
                     run_duration += r_duration.count();
                     // printf("run time: %lld\n", r_duration.count());
 
-
                     // int ret = rknn_matmul_run(sub_kernel->ctx);
 
-                    results[A_column_block] = (float*)sub_kernel->C->virt_addr;
+                    results[A_column_block] = (float *)sub_kernel->C->virt_addr;
                     // printf("result of sub_kernel:\n");
                     // for(int i = 0 ; i < A_row_cnt; i++){
                     //     for(int j = 0 ; j < A_block_column; j++){
@@ -1085,28 +1702,26 @@ void compute_submat_mul(int64_t m, // matrix A row
                     // printf("done\n");
 
                     auto memcpy_to_result_start = std::chrono::high_resolution_clock::now();
-                    float * float_result = (float*)malloc(A_row_cnt * A_block_column * sizeof(float));
+                    float *float_result = (float *)malloc(A_row_cnt * A_block_column * sizeof(float));
                     memcpy(float_result, results[A_column_block], A_row_cnt * A_block_column * sizeof(float));
                     auto memcpy_to_result_end = std::chrono::high_resolution_clock::now();
                     auto memcpy_to_result_duration = std::chrono::duration_cast<std::chrono::microseconds>(memcpy_to_result_end - memcpy_to_result_start);
                     // printf("memcpy to result time: %lld\n", memcpy_to_result_duration.count());
-                    memcpy_duration+= memcpy_to_result_duration.count();
+                    memcpy_duration += memcpy_to_result_duration.count();
 
                     results_float[A_column_block] = float_result;
-                    if(initialized){
+                    if (initialized)
+                    {
                         free(sub_A_data);
                         free(sub_B_data);
                     }
                 }
-                int C_offset =  C_row_block * C_block_column_cnt * A_row_cnt * A_block_column
-                                + C_column_block * A_block_column;
+                int C_offset = C_row_block * C_block_column_cnt * A_row_cnt * A_block_column + C_column_block * A_block_column;
                 // printf("C_offset: %d, dst->ne[0]: %d, dst->ne[1]: %d\n", (int)C_offset, (int)dst->ne[0], (int)dst->ne[1]);
-                
+
                 auto create_tmp_result_start = std::chrono::high_resolution_clock::now();
-                float * C_block_start = (float*)C_data
-                                            + C_row_block * sub_n * C_block_row
-                                            + C_column_block * A_block_column;
-                float * tmp_result = (float*)malloc(A_row_cnt * A_block_column* sizeof(float)); // waiting 
+                float *C_block_start = (float *)C_data + C_row_block * sub_n * C_block_row + C_column_block * A_block_column;
+                float *tmp_result = (float *)malloc(A_row_cnt * A_block_column * sizeof(float)); // waiting
                 memset(tmp_result, 0, A_row_cnt * A_block_column * sizeof(float));
                 auto create_tmp_result_end = std::chrono::high_resolution_clock::now();
                 auto create_tmp_result_duration = std::chrono::duration_cast<std::chrono::microseconds>(create_tmp_result_end - create_tmp_result_start);
@@ -1115,9 +1730,12 @@ void compute_submat_mul(int64_t m, // matrix A row
                 // printf("tmp_result1\n");
 
                 auto sum_result_start = std::chrono::high_resolution_clock::now();
-                for(int block = 0 ; block < A_block_column_cnt ;block++){
-                    for(int i = 0 ; i < A_row_cnt ; i++){
-                        for(int j = 0 ; j < A_block_column; j++){
+                for (int block = 0; block < A_block_column_cnt; block++)
+                {
+                    for (int i = 0; i < A_row_cnt; i++)
+                    {
+                        for (int j = 0; j < A_block_column; j++)
+                        {
                             tmp_result[i * A_block_column + j] += results_float[block][i * A_block_column + j];
                             // printf("%4.f ", results[block][i * A_block_column + j]);
                         }
@@ -1140,10 +1758,11 @@ void compute_submat_mul(int64_t m, // matrix A row
                 // <<<<<<<<<<<<<<<<<<<<<done<<<<<<<<<<<<<<<<<<<<<<
 
                 auto memcpy_to_result_start = std::chrono::high_resolution_clock::now();
-                for(int i = 0 ; i < A_row_cnt ; i++){
-                    memcpy(C_block_start + i * sub_n, 
-                            tmp_result + i * A_block_column , 
-                            B_column_ele_cnt * sizeof(float));
+                for (int i = 0; i < A_row_cnt; i++)
+                {
+                    memcpy(C_block_start + i * sub_n,
+                           tmp_result + i * A_block_column,
+                           B_column_ele_cnt * sizeof(float));
                 }
                 auto memcpy_to_result_end = std::chrono::high_resolution_clock::now();
                 auto memcpy_to_result_duration = std::chrono::duration_cast<std::chrono::microseconds>(memcpy_to_result_end - memcpy_to_result_start);
@@ -1156,14 +1775,14 @@ void compute_submat_mul(int64_t m, // matrix A row
                 // printf("free sub_A\n");
                 free(tmp_result);
                 // printf("freed\n");
-
             }
-
         }
         auto memcpy_to_result_start = std::chrono::high_resolution_clock::now();
-        for(int i = 0 ; i < m;i++){
-            for(int j = 0 ; j < sub_n ;j++){
-                ((float *)dst->data)[i * sub_n + j] = ((float*)C_data)[i * sub_n + j];
+        for (int i = 0; i < m; i++)
+        {
+            for (int j = 0; j < sub_n; j++)
+            {
+                ((float *)dst->data)[i * sub_n + j] = ((float *)C_data)[i * sub_n + j];
             }
         }
         auto memcpy_to_result_end = std::chrono::high_resolution_clock::now();
@@ -1172,7 +1791,7 @@ void compute_submat_mul(int64_t m, // matrix A row
         memcpy_to_result += memcpy_to_result_duration.count();
 
         auto total_end = std::chrono::high_resolution_clock::now();
-        auto total_duration_end = std::chrono::duration_cast<std::chrono::microseconds>(total_end- total_start);
+        auto total_duration_end = std::chrono::duration_cast<std::chrono::microseconds>(total_end - total_start);
         // printf("run time: %lld\n", total_duration_end.count());
         total_duration += total_duration_end.count();
 
@@ -1189,223 +1808,28 @@ void compute_submat_mul(int64_t m, // matrix A row
         printf("dst->data copied\n");
         free(C_data);
     }
-    else{
-        // int64_t m = m;
-        int64_t n = dst_n;
-        int64_t k = ori_k;
+}
 
-        printf("m: %d, k: %d, n: %d\n",  (int)m, (int)k, (int)n);
-        memset(dst->data, 0, m * n * sizeof(float));
+void dump_matrix_shape(const int64_t A_row_00, const int64_t A_col_00, const int64_t A_row_01, const int64_t A_col_01, const int64_t A_row_10, const int64_t A_col_10, const int64_t A_row_11, const int64_t A_col_11, const int64_t B_row_00, const int64_t B_col_00, const int64_t B_row_01, const int64_t B_col_01, const int64_t B_row_10, const int64_t B_col_10, const int64_t B_row_11, const int64_t B_col_11)
+{
+    {
 
-        // >>>>>>>>>>>>>>>Debug>>>>>>>>>>>>>>>.
-        // check_A_B_data(m, k, A_data, n, B_data);
-        // <<<<<<<<<<<<<<<<<<<<<done<<<<<<<<<<<<<<<<<<<<<<<<<
-
-        const int64_t A_row_00 = m / 32 * 32;
-        const int64_t A_row_01 = A_row_00;
-        const int64_t A_row_10 = m - A_row_00;
-        const int64_t A_row_11 = A_row_10;
-
-        const int64_t A_col_00 = k / 32 * 32;
-        const int64_t A_col_01 = k - A_col_00;
-        const int64_t A_col_10 = A_col_00;
-        const int64_t A_col_11 = A_col_01;
-
-        const int64_t B_row_00 = k / 32 * 32;
-        const int64_t B_row_01 = B_row_00;
-        const int64_t B_row_10 = k - B_row_00;
-        const int64_t B_row_11 = B_row_10;
-
-        const int64_t B_col_00 = n / 32 * 32;
-        const int64_t B_col_01 = n - B_col_00;
-        const int64_t B_col_10 = B_col_00;
-        const int64_t B_col_11 = B_col_01;
-
-        {
-
-            printf("A_row_00: %d, A_col_00: %d, A_row_01: %d, A_col_01: %d\n", (int)A_row_00, (int)A_col_00, (int)A_row_01, (int)A_col_01);
-            printf("A_row_10: %d, A_col_10: %d, A_row_11: %d, A_col_11: %d\n", (int)A_row_10, (int)A_col_10, (int)A_row_11, (int)A_col_11);
-            printf("B_row_00: %d, B_col_00: %d, B_row_01: %d, B_col_01: %d\n", (int)B_row_00, (int)B_col_00, (int)B_row_01, (int)B_col_01);
-            printf("B_row_10: %d, B_col_10: %d, B_row_11: %d, B_col_11: %d\n", (int)B_row_10, (int)B_col_10, (int)B_row_11, (int)B_col_11);
-        }
-        // pad A01, A10, A11, B01, B10, B11
-
-        double prepare_data_time = 0; 
-        double total_run_time = 0;
-
-        auto total_run_start = std::chrono::high_resolution_clock::now();
-
-        void * pad_A00 = nullptr;
-        void * pad_A01 = nullptr;
-        void * pad_A10 = nullptr;
-        void * pad_A11 = nullptr;
-        void * pad_B00 = nullptr;
-        void * pad_B01 = nullptr;
-        void * pad_B10 = nullptr;
-        void * pad_B11 = nullptr;
-
-
-
-        auto prepare_data_start = std::chrono::high_resolution_clock::now();
-        if(A_row_00 != 0 && A_col_00 != 0){
-            pad_A00 = malloc(A_row_00 * A_col_00 * sizeof(rknpu2::float16));
-            for(int i = 0 ; i < A_row_00; i++){
-                memcpy((rknpu2::float16*)pad_A00 + i * A_col_00, 
-                        (rknpu2::float16*)A_data + i * k , 
-                        A_col_00 * sizeof(rknpu2::float16));
-            }
-            printf("pad_A00:\n");
-            check_pad(A_row_00, A_col_00, pad_A00);
-        }
-
-        if(B_row_00 != 0 && B_col_00 != 0){
-            pad_B00 = malloc(B_row_00 * B_col_00 * sizeof(rknpu2::float16));
-            for(int i = 0 ; i < B_row_00; i++){
-                memcpy((rknpu2::float16*)pad_B00 + i * B_col_00, 
-                        (rknpu2::float16*)B_data + i * n , 
-                        B_col_00 * sizeof(rknpu2::float16));
-            }
-            printf("pad_B00:\n");
-            check_pad(B_row_00, B_col_00, pad_B00);
-        }
-        
-        // take A01 as an example
-        // TODO: Abstract the code
-        pad_side_matrix(A_row_01, A_col_01, A_data, A_row_00, k, pad_A01, A_col_00);
-        
-        if(A_row_10 != 0 && A_col_10 != 0){
-            void * A10_start = (rknpu2::float16*)A_data + A_row_00 * k;
-            pad_A10 = pad_sub_matrix(A_row_10, A_col_10, 0, A10_start, k);
-            printf("pad_A10:\n");
-            check_pad(32, A_col_10, pad_A10);
-        }
-
-        if(A_row_11 != 0 && A_col_11 != 0){
-            void * A11_start = (rknpu2::float16*)A_data + A_row_00 * k;
-            pad_A11 = pad_sub_matrix(A_row_11, A_col_11, A_col_10, A11_start, k);
-            printf("pad_A11: \n");
-            check_pad(32,32,pad_A11);
-        }
-
-        if(B_row_01 != 0 && B_col_01 != 0){
-            void * B01_start = (rknpu2::float16*)B_data + B_row_00 * n;
-            pad_B01 = pad_sub_matrix(B_row_01, B_col_01, B_col_00, B_data, n);
-            printf("pad_B01:\n");
-            check_pad(B_row_01, 32, pad_B01);
-        }
-
-        if(B_row_10 != 0 && B_col_10 != 0){
-            void * B10_start = (rknpu2::float16*)B_data + B_row_00 * n;
-            pad_B10 = pad_sub_matrix(B_row_10, B_col_10, 0, B10_start, n);
-            printf("pad_B10:\n");
-            check_pad(32, B_col_10, pad_B10);
-        }
-
-        if(B_row_11 != 0 && B_col_11 != 0){
-            void * B11_start = (rknpu2::float16*)B_data + B_row_00 * n;
-            pad_B11 = pad_sub_matrix(B_row_11, B_col_11, B_col_10, B11_start, n);
-            printf("pad_B11:\n");
-            check_pad(32, 32, pad_B11);
-        }
-
-        auto prepare_data_end = std::chrono::high_resolution_clock::now();
-        auto prepare_data_duration = std::chrono::duration_cast<std::chrono::microseconds>(prepare_data_end - prepare_data_start);
-        prepare_data_time = prepare_data_duration.count();
-
-
-        
-
-        int C_tile = 0;
-        // A00 x B00 
-        if(A_row_00!=0 && B_row_00!=0 && A_col_00!=0 && B_col_00!=0)
-        {
-            side_matrix_multiplication(A_row_00, A_col_00, B_row_00, B_col_00, pad_A00, pad_B00, type, thread_idx, C_tile, dst, n, 2, 0, 0);
-        }
-
-
-        // A01 x B10
-        if(pad_A01 != nullptr && pad_B10 != nullptr){
-            side_matrix_multiplication(A_row_01, A_col_01, B_row_10, B_col_10, pad_A01, pad_B10, type, thread_idx, C_tile, dst, n, 2, 0, 0);
-        }
-
-        // A00 x B01
-        if(A_row_00 != 0 && A_col_00 != 0 && pad_B01 != nullptr)
-        {
-            C_tile = 1;
-            side_matrix_multiplication(A_row_00, A_col_00, B_row_01, B_col_01, pad_A00, pad_B01, type, thread_idx, C_tile, dst, n, 3, B_col_00, 0);
-
-        }
-
-        // A01 x B11
-        if(pad_A01 != nullptr && pad_B11 != nullptr)
-        {
-            C_tile = 1;
-            side_matrix_multiplication(A_row_01, A_col_01, B_row_11, B_col_11, pad_A01, pad_B11, type, thread_idx, C_tile, dst, n, 4, B_col_00, 0);
-        }
-
-        // A10 x B00
-        if(pad_A10 != nullptr && pad_B00 != nullptr){
-            C_tile = 2;
-            side_matrix_multiplication(A_row_10, A_col_10, B_row_00, B_col_00, pad_A10, pad_B00, type, thread_idx, C_tile, dst, n, 5, 0, A_row_00);
-        }
-
-        // A11 x B10
-        if(pad_A11 != nullptr && pad_B10 != nullptr){
-            C_tile = 2;
-            side_matrix_multiplication(A_row_11, A_col_11, B_row_10, B_col_10, pad_A11, pad_B10, type, thread_idx, C_tile, dst, n, 6, 0, A_row_00);
-        }
-
-        // A10 x B01
-        if(pad_A10 != nullptr && pad_B01 != nullptr){
-            C_tile = 3;
-            side_matrix_multiplication(A_row_10, A_col_10, B_row_01, B_col_01, pad_A10, pad_B01, type, thread_idx, C_tile, dst, n, 7, B_col_00, A_row_00);
-        }
-        // A11 x B11
-        if(pad_A11 != nullptr && pad_B01 != nullptr){
-            C_tile = 3;
-            side_matrix_multiplication(A_row_11, A_col_11, B_row_11, B_col_11, pad_A11, pad_B11, type, thread_idx, C_tile, dst, n, 8, B_col_00, A_row_00);
-        }
-
-        auto total_run_end = std::chrono::high_resolution_clock::now();
-        auto total_run_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_run_end - total_run_start);
-        total_run_time = total_run_duration.count();
-
-        printf("prepare data time: %.f\n", prepare_data_time);
-        printf("total_run_time: %.f\n", total_run_time);
-        if(pad_A00!= nullptr)
-        {
-            free(pad_A00);
-        }
-        if(pad_A01!= nullptr)
-        {
-            free(pad_A01);
-        }
-        if(pad_A10!= nullptr)
-        {
-            free(pad_A10);
-        }
-        if(pad_A11!= nullptr)
-        {
-            free(pad_A11);
-        }
-        if(pad_B00!= nullptr)
-        {
-            free(pad_B00);
-        }
-        if(pad_B01!= nullptr)
-        {
-            free(pad_B01);
-        }
-        if(pad_B10!= nullptr)
-        {
-            free(pad_B10);
-        }
-        if(pad_B11!= nullptr)
-        {
-            free(pad_B11);
-        }
-
+        printf("A_row_00: %d, A_col_00: %d, A_row_01: %d, A_col_01: %d\n", (int)A_row_00, (int)A_col_00, (int)A_row_01, (int)A_col_01);
+        printf("A_row_10: %d, A_col_10: %d, A_row_11: %d, A_col_11: %d\n", (int)A_row_10, (int)A_col_10, (int)A_row_11, (int)A_col_11);
+        printf("B_row_00: %d, B_col_00: %d, B_row_01: %d, B_col_01: %d\n", (int)B_row_00, (int)B_col_00, (int)B_row_01, (int)B_col_01);
+        printf("B_row_10: %d, B_col_10: %d, B_row_11: %d, B_col_11: %d\n", (int)B_row_10, (int)B_col_10, (int)B_row_11, (int)B_col_11);
     }
+}
+
+void dump_time_usage(double prepare_data_time, in_kernel_time &kernel_time, double total_run_time)
+{
+    printf("prepare data time: %.f\n", prepare_data_time);
+    printf("memcpy to kernel time: %.f\n", kernel_time.memcpy_to_kernel_time);
+    printf("find kernel time: %.f\n", kernel_time.find_kernel_time);
+    printf("set io time: %.f\n", kernel_time.set_io_time);
+    printf("run time: %.f\n", kernel_time.run_time);
+    printf("sum result time: %.f\n", kernel_time.sum_result_time);
+    printf("total_run_time: %.f\n", total_run_time);
 }
 
 void pad_side_matrix(const int64_t A_row_01, const int64_t A_col_01, const void *A_data, const int64_t A_row_00, int64_t k, void *&pad_A01, const int64_t A_col_00)
@@ -1413,15 +1837,23 @@ void pad_side_matrix(const int64_t A_row_01, const int64_t A_col_01, const void 
     if (A_row_01 != 0 && A_col_01 != 0)
     {
         void *A01_start = (rknpu2::float16 *)A_data + A_row_00 * k;
-        pad_A01 = pad_sub_matrix(A_row_01, A_col_01, A_col_00, A_data, k);
-        printf("pad_A01:\n");
-        check_pad(A_row_01, 32, pad_A01);
+        // pad_A01 = pad_sub_matrix(A_row_01, A_col_01, A_col_00, A_data, k, true);
+        void * tmp_mat= pad_sub_matrix(A_row_01, A_col_01, A_col_00, A_data, k, true);
+        // printf("A_row_01: %d, A_col_01: %d, A_col_00: %d\n", (int)A_row_01, (int)A_col_01, (int)A_col_00);
+        int pad_col_01 = A_col_01 < 32 ? 32 : A_col_01 / 32 * 32;
+        // printf("pad_col_01: %d\n", (int)pad_col_01);
+        matrixA_to_perf_layout(tmp_mat, pad_A01, A_row_01, pad_col_01);
+        // printf("pad_A01 done\n");
+        // check_pad(A_row_01, 32, pad_A01);
     }
 }
 
-void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, const int64_t B_row_10, const int64_t B_col_10, void *pad_A01, void *pad_B10, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row)
+// MARK: side matmul
+
+void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, const int64_t B_row_10, const int64_t B_col_10, void *pad_A01, void *pad_B10, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row, in_kernel_time &kernel_time, bool matrix_B00_need_set_io)
 {
-    int A_pad_row_01 = A_row_01 < 32 ? 32 : A_row_01 / 32 * 32;
+    // int A_pad_row_01 = A_row_01 < 32 ? 32 : A_row_01 / 32 * 32;
+    int A_pad_row_01 = A_row_01;
     int A_pad_col_01 = A_col_01 < 32 ? 32 : A_col_01 / 32 * 32;
     int B_pad_row_10 = B_row_10 < 32 ? 32 : B_row_10 / 32 * 32;
     int B_pad_col_10 = B_col_10 < 32 ? 32 : B_col_10 / 32 * 32;
@@ -1433,25 +1865,53 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
     int ret = 0;
 
     // TODO: change the thread_idx 
+    auto create_kernel_start = std::chrono::high_resolution_clock::now();
     ggml_rknpu2_matmul_kernel *sub_kernel = ggml_rknpu2_matmul_kernel_create(pad_A01, pad_B10, A_size, B_size, A_pad_row_01, A_pad_col_01, B_pad_col_10, type, 1, initialized);
+    auto create_kernel_end = std::chrono::high_resolution_clock::now();
+    auto create_kernel_duration = std::chrono::duration_cast<std::chrono::microseconds>(create_kernel_end - create_kernel_start).count();
+    kernel_time.find_kernel_time+= create_kernel_duration;
 
     if (initialized == 0)
     {
+        auto copy_to_mem_start = std::chrono::high_resolution_clock::now();
         memcpy(sub_kernel->A->virt_addr, pad_A01, A_pad_row_01 * A_pad_col_01 * sizeof(rknpu2::float16));
-        memcpy(sub_kernel->B->virt_addr, pad_B10, B_pad_row_10 * B_pad_col_10 * sizeof(rknpu2::float16));
+        if(!sub_kernel->B_is_copied){
+            memcpy(sub_kernel->B->virt_addr, pad_B10, B_pad_row_10 * B_pad_col_10 * sizeof(rknpu2::float16));
+            sub_kernel->B_is_copied = true;
+        }
+
+        auto copy_to_mem_end = std::chrono::high_resolution_clock::now();
+        auto copy_to_mem_duration = std::chrono::duration_cast<std::chrono::microseconds>(copy_to_mem_end - copy_to_mem_start).count();
+        kernel_time.memcpy_to_kernel_time += copy_to_mem_duration;
     }
 
     {
+        auto set_io_start = std::chrono::high_resolution_clock::now();
         rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->A, &sub_kernel->io_attr.A);
-        rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->B, &sub_kernel->io_attr.B);
+        if(matrix_B00_need_set_io)
+        {
+            rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->B, &sub_kernel->io_attr.B);
+        }
+        // rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->B, &sub_kernel->io_attr.B);
         rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->C, &sub_kernel->io_attr.C);
+        auto set_io_end = std::chrono::high_resolution_clock::now();
+        auto set_io_duration = std::chrono::duration_cast<std::chrono::microseconds>(set_io_end - set_io_start).count();
+        kernel_time.set_io_time += set_io_duration;
+
     }
 
     {
+        int64_t run_start = getCurrentTimeUs();
         ret = rknn_matmul_run(sub_kernel->ctx);
+        int64_t run_end = getCurrentTimeUs();
+        int64_t run_duration = run_end - run_start;
+        kernel_time.run_time += run_duration;
     }
 
     {
+        void* norm_layout_C = malloc(A_row_01 * B_col_10 * sizeof(float));
+        perf_matrixC_to_norm_layout(sub_kernel->C->virt_addr, norm_layout_C, A_row_01, B_col_10);
+        auto sum_result_start = std::chrono::high_resolution_clock::now();
         if (C_tile == 0)
         {
             for (int i = 0; i < A_row_01; i++)
@@ -1459,7 +1919,7 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
                 for (int j = 0; j < B_col_10; j++)
                 {
                     float* dst_data = (float *)dst->data + offset_col + offset_row * n;
-                    dst_data[i * n + j] += ((float *)sub_kernel->C->virt_addr)[i * B_pad_col_10 + j];
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_10 + j];
                 }
             }
             // printf("id: %d\n", id);
@@ -1475,7 +1935,7 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
             {
                 for (int j = 0; j < B_col_10; j++)
                 {
-                    dst_data[i * n + j] += ((float *)sub_kernel->C->virt_addr)[i * B_pad_col_10 + j];
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_10 + j];
                 }
             }
             // if(id == 3){
@@ -1494,7 +1954,7 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
             {
                 for (int j = 0; j < B_col_10; j++)
                 {
-                    dst_data[i * n + j] += ((float *)sub_kernel->C->virt_addr)[i * B_pad_col_10 + j];
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_10 + j];
                 }
             }
             // if(id == 5){
@@ -1514,7 +1974,7 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
             {
                 for (int j = 0; j < B_col_10; j++)
                 {
-                    dst_data[i * n + j] += ((float *)sub_kernel->C->virt_addr)[i * B_pad_col_10 + j];
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_10 + j];
                 }
             }
             // if(id == 7){
@@ -1526,29 +1986,48 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
             //     A00xB00(A_row_01, B_col_10, dst, n, offset_col, offset_row);
             //     check_A00xB00_CPU(A_pad_row_01, B_pad_col_10, A_pad_col_01, pad_A01, pad_B10, (float *)sub_kernel->C->virt_addr, B_pad_col_10);
             // }
-            
         }
+        auto sum_result_end = std::chrono::high_resolution_clock::now();
+        auto sum_result_duration = std::chrono::duration_cast<std::chrono::microseconds>(sum_result_end - sum_result_start).count();
+        kernel_time.sum_result_time += sum_result_duration;
     }
 }
 
-void check_pad(const int64_t row, const int64_t col, void *pad_A01)
-{
-    // for (int i = 0; i < row; i++)
-    // {
-    //     for (int j = 0; j < col; j++)
-    //     {
-    //         printf("%2.f ", (float)((rknpu2::float16 *)pad_A01)[i * col + j]);
-    //     }
-    //     printf("\n");
-    // }
+void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, const int64_t B_row_10, const int64_t B_col_10, void *pad_A01, void *pad_B10, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row, in_kernel_time &kernel_time){
+    side_matrix_multiplication(A_row_01, A_col_01, B_row_10, B_col_10, pad_A01, pad_B10, type, thread_idx, C_tile, dst, n, id, offset_col, offset_row, kernel_time, true);
 }
 
-void * pad_sub_matrix(const int64_t A_row_01, const int64_t A_col_01, int64_t offset, const void *A_data, int64_t k)
+void side_matrix_multiplication(matrix_ctx A, matrix_ctx B, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row, in_kernel_time &kernel_time)
+{
+    side_matrix_multiplication(A.row, A.col, B.row, B.col, A.data, B.data, type, thread_idx, C_tile, dst, n, id, offset_col, offset_row, kernel_time, true);
+}
+
+void side_matrix_multiplication(matrix_ctx A, matrix_ctx B, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row, in_kernel_time &kernel_time, bool matrix_B00_need_set_io)
+{
+    side_matrix_multiplication(A.row, A.col, B.row, B.col, A.data, B.data, type, thread_idx, C_tile, dst, n, id, offset_col, offset_row, kernel_time, matrix_B00_need_set_io);
+}
+
+
+void check_pad(const int64_t row, const int64_t col, void *pad_A01)
+{
+    for (int i = 0; i < row; i++)
+    {
+        for (int j = 0; j < col; j++)
+        {
+            printf("%2.f ", (float)((rknpu2::float16 *)pad_A01)[i * col + j]);
+        }
+        printf("\n");
+    }
+}
+
+void * pad_sub_matrix(const int64_t A_row_01, const int64_t A_col_01, int64_t offset, const void *A_data, int64_t k, bool is_A)
 {
     int64_t ori_row = A_row_01;
     int64_t ori_col = A_col_01;
     int64_t pad_row = A_row_01 < 32 ? 32 : A_row_01 / 32 * 32;
     int64_t pad_col = A_col_01 < 32 ? 32 : A_col_01 / 32 * 32;
+
+    if(is_A) pad_row = ori_row;
     int64_t pad_size = pad_row * pad_col * sizeof(rknpu2::float16);
     void *pad_matrix = malloc(pad_size);
     memset(pad_matrix, 0, pad_size);
@@ -1558,9 +2037,6 @@ void * pad_sub_matrix(const int64_t A_row_01, const int64_t A_col_01, int64_t of
                (rknpu2::float16 *)A_data + offset + i * k,
                ori_col * sizeof(rknpu2::float16));
     }
-    // >>>>>>>debug>>>>>>>>>>>
-    
-    // <<<<<<<<<done<<<<<<<<<<<<<
     return pad_matrix;
 }
 
@@ -1698,7 +2174,7 @@ void copy_submatrix_A_process(int A_row_block, const int A_block_row_cnt, int &A
 }
 
 void pad_matrix_A(
-    void * A_data,
+    const void * A_data,
     void * A_pad_data,
     int m,
     int k,
@@ -1759,18 +2235,15 @@ void transpose_matrix_B(
     }
 }
 
-static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, rknn_matmul_type inference_type) {
+// MARK: ggml_rk_mul_mat
+
+static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst, rknn_matmul_type inference_type) {
 
 
     auto start = std::chrono::high_resolution_clock::now();
     std::vector<std::thread> threads;
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    printf("initilized threads time: %lld\n", duration.count());
-
-    printf("using multi threads B \n");
-
-    // matrix B has transposed -> matrix B is column major
     const int64_t n = src1->ne[1]; // matrix B columns
     int n_threads = (int)((ggml_backend_rknn_context * )backend->context)->n_threads;
     threads.reserve(n_threads);
@@ -1789,8 +2262,6 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         pad_k = (k / 32 + 1) * 32;
     }
 
-    printf("pad_n: %d, pad_k: %d\n", (int)pad_n, (int)pad_k);
-    // pad the matrix
     start = std::chrono::high_resolution_clock::now();
 
     void * A_data = src0->data;
@@ -1799,54 +2270,35 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     memset(dst->data, 0, dst->ne[0] * dst->ne[1] * sizeof(rknpu2::float16));
 
-    void * A_transposed_data;
-    if(m != 1){
-         A_transposed_data = malloc(m * k * sizeof(rknpu2::float16));
-        transpose_matrix_A(A_transposed_data, A_data, m, k);
-        // printf("A_transposed_data:\n");
-        // for(int i = 0; i < k; i++){
-        //     for(int j = 0; j < m; j++){
-        //         printf("%4.f ", (float)((rknpu2::float16*)A_transposed_data)[i * m + j]);
-        //     }
-        //     printf("\n");
-        // }
-    }
-    else{
-        A_transposed_data = A_data;
-    }
-    // void * B_transposed_data = malloc(k * n * sizeof(rknpu2::float16));
-    // transpose_matrix_B(B_transposed_data, B_data, n, k);
+    void * A_transposed_data = A_data;
 
-    printf("zero padding done!\n");
     end = std::chrono::high_resolution_clock::now();
     duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    printf("padding time: %lld\n", duration.count());
 
-
-    //measure the overhead of creating the threads
     for(int t = 0; t < n_threads; t++){
 
         int64_t col_start = t * n / n_threads;
         int64_t col_end = (t + 1) * n / n_threads;
-
         int64_t sub_n = col_end - col_start;
 
         void * A_compute_data = A_data;
         void * B_compute_data = (rknpu2::float16*)B_data + col_start * k;
 
         // run the thread;
-        threads.emplace_back([m, pad_k, A_compute_data, A_transposed_data, B_compute_data, dst, col_start, col_end, t, inference_type, k, n](){
+        threads.emplace_back([m, pad_k, A_compute_data, A_transposed_data, B_compute_data, dst, col_start, col_end, t, inference_type, k, n, src0, src1](){
 
             //TODO: Change dst_n to the real value
             int64_t dst_n = dst->ne[1];
-            printf("dst_n: %d\n", dst_n);
+            // printf("dst_n: %d\n", dst_n);
 
-            compute_submat_mul(dst_n,pad_k, B_compute_data, A_transposed_data, dst, col_start, col_end, t, inference_type, m, k);
+            // compute_submat_mul(dst_n,pad_k, B_compute_data, A_transposed_data, dst, col_start, col_end, t, inference_type, m, k);
+            // compute_submat_mul(m,pad_k, A_compute_data, B_compute_data, dst, col_start, col_end, t, inference_type, dst_n, k, src0, src1);
+            compute_submat_mul(dst_n,pad_k, B_compute_data, A_compute_data, dst, col_start, col_end, t, inference_type, m, k, src1, src0);
         });
     }
     end = std::chrono::high_resolution_clock::now();
     duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    printf("thread creation time: %lld\n", duration.count());
+    // printf("thread creation time: %lld\n", duration.count());
 
 
     start = std::chrono::high_resolution_clock::now();
@@ -1856,23 +2308,23 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
     end = std::chrono::high_resolution_clock::now();
     duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    printf("waiting computation time: %lld\n", duration.count());
+    // printf("waiting computation time: %lld\n", duration.count());
 
-    free(A_transposed_data);
+    // if(m != 1){
+    //     free(A_transposed_data);
+    // }
 
     // free(B_transposed_data);
 
 }
 
-typedef void (*ggml_rk_func_t)(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, rknn_matmul_type type);
+typedef void (*ggml_rk_func_t)(ggml_backend_t backend, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst, rknn_matmul_type type);
 
 bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor) {
     ggml_rk_func_t func = nullptr;
 
     ggml_tensor * src0 = tensor->src[0];
     ggml_tensor * src1 = tensor->src[1];
-
-    // save src0 src1's shape to a external file
 
     //check src0 and src1 data
     // printf("src0 data, src0->ne[1]: %d, src0->ne[0]: %d\n", (int)src0->ne[1], (int)src0->ne[0]);
@@ -1907,15 +2359,16 @@ bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
 
     rknn_matmul_type matmul_type;
     matmul_type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
+    printf("src0->type: %d, src1->type: %d\n", src0->type, src1->type);
     if(src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16){
         matmul_type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
-    }else if(src0->type == GGML_TYPE_I8 && src1->type == GGML_TYPE_I8){
+    }else if(src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_Q8_0){
         matmul_type = RKNN_INT8_MM_INT8_TO_INT32;
     }
     auto start = std::chrono::high_resolution_clock::now();
     func(backend, tensor->src[0], tensor->src[1], tensor, matmul_type);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    printf("total time: %lld\n", duration.count());
+    // printf("total time: %lld\n", duration.count());
     return true;
 }

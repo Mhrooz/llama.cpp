@@ -1,3 +1,19 @@
+
+configure_file(
+    ../../include/model_related_config.h.in
+    ${CMAKE_BINARY_DIR}/model_related_config.h
+    @ONLY
+)
+include_directories(${CMAKE_BINARY_DIR})
+
+include(FetchContent)
+FetchContent_Declare(
+    json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.2
+)
+FetchContent_MakeAvailable(json)
+
 set(TARGET_NAME ggml-rknn)
 
 ggml_add_backend_library(${TARGET_NAME}
@@ -17,7 +33,7 @@ endif()
 
 message(STATUS "using rknn")
 target_link_directories(${TARGET_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(${TARGET_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/lib/librkllmrt.so ${CMAKE_SOURCE_DIR}/lib/librknnrt.so)
+target_link_libraries(${TARGET_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/lib/librkllmrt.so ${CMAKE_SOURCE_DIR}/lib/librknnrt.so nlohmann_json::nlohmann_json)
 target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/lib)
 
 
