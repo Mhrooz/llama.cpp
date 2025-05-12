@@ -75,6 +75,110 @@ struct pad_data{
     bool is_padded=false;
 };
 
+
+enum matrix_t{
+    FLOAT16,
+    INT8,
+    INT4
+};
+
+std::map<matrix_t, size_t> MATRIX_SIZE = {
+    {FLOAT16, sizeof(float16)},
+    {INT8, sizeof(int8_t)},
+    {INT4, sizeof(int8_t)}
+};
+
+struct mat_info{
+    int64_t row;
+    int64_t col;
+    int64_t pad_row;
+    int64_t pad_col;
+    matrix_t matrix_type;
+    void ** ori_data;
+    void ** pad_data;
+    size_t ori_size;
+    size_t pad_size;
+    char * matrix_name;
+    bool is_padded=false;
+    bool is_A=false;
+
+    mat_info(int64_t row, 
+        int64_t col,
+        int64_t pad_row, 
+        int64_t pad_col, 
+        matrix_t matrix_type, 
+        void ** ori_data, 
+        void ** pad_data, 
+        size_t ori_size, 
+        size_t pad_size, 
+        char * matrix_name, 
+        bool is_padded, 
+        bool is_A): 
+        row(row), 
+        col(col), 
+        pad_row(pad_row), 
+        pad_col(pad_col), 
+        matrix_type(matrix_type), 
+        ori_data(ori_data), 
+        pad_data(pad_data), 
+        ori_size(ori_size), 
+        pad_size(pad_size), 
+        matrix_name(matrix_name), 
+        is_padded(is_padded), 
+        is_A(is_A)
+        {}
+
+    mat_info(int64_t row_, 
+        int64_t col_,
+        matrix_t matrix_type_, 
+        void ** data_, 
+        bool is_A_, 
+        char* name_)
+    : mat_info(
+            row_,
+            col_,
+            row_ < 32 ? 32 : (((row_ - 1) / 32 + 1) * 32),
+            col_ < 32 ? 32 : (((col_ - 1) / 32 + 1) * 32),
+            matrix_type_,
+            data_,
+            NULL,
+            row_ * col_ * MATRIX_SIZE[matrix_type_],
+            (row_ < 32 ? 32 : (((row_ - 1)/ 32 + 1) * 32)) * (col_ < 32 ? 32 : (((col_ - 1)/ 32 + 1) * 32)) * MATRIX_SIZE[matrix_type_],
+            name_,
+            false,
+            is_A_
+        )
+    {
+        if(is_A_){
+            this->pad_row = row_;
+        }
+    }
+
+    mat_info(int64_t row_, int64_t col_, matrix_t matrix_type_, void ** data_, bool is_A_)
+        : mat_info( row_, col_, matrix_type_, data_, is_A_, NULL) 
+    {}
+};
+
+
+struct matmul_ctx{
+    mat_info mat_A;
+    mat_info mat_B;
+    rknn_matmul_type type;
+    int thread_idx;
+    bool matrix_B00_need_set_io = false;
+    matmul_ctx(mat_info mat_A, mat_info mat_B, rknn_matmul_type type, int thread_idx): mat_A(mat_A), mat_B(mat_B), type(type), thread_idx(thread_idx) {}
+};
+void check_pad_float(const int64_t row, const int64_t col, void *pad_A01)
+{
+    for (int i = 0; i < row; i++)
+    {
+        for (int j = 0; j < col; j++)
+        {
+            printf("%2.f ", ((float*)pad_A01)[i * col + j]);
+        }
+        printf("\n");
+    }
+}
 bool read_shape_pairs_from_json(
     const std::string& filename,
     std::vector<matrixPair>& out_pairs) {
@@ -183,7 +287,7 @@ const char* rknpu2_matmul_type_to_string(rknn_matmul_type type)
     }
 }
 
-static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(int m, int k, int n, rknn_matmul_type type, int thread_idx, const void * A_data, void * B_data, size_t A_size, size_t B_size) {
+struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(int m, int k, int n, rknn_matmul_type type, int thread_idx, const void * A_data, void * B_data, size_t A_size, size_t B_size) {
   for (int i = 0; i < matmul_kernels_count; i++) {
     ggml_rknpu2_matmul_kernel *kernel = &matmul_kernels[i];
     if (
@@ -208,8 +312,11 @@ static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(int m, 
 // MARK: Kernel find
 
 static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(matrix_ctx A, matrix_ctx B, rknn_matmul_type type, int thread_idx){
-    // printf("ggml_rknpu2_matmul_kernel_find: %d, %d, %d\n", A.row, A.col, B.col);
     return ggml_rknpu2_matmul_kernel_find(A.row, A.col, B.col, type, thread_idx, NULL, NULL, 0, 0);
+}
+
+static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(matmul_ctx ctx){
+    return ggml_rknpu2_matmul_kernel_find(ctx.mat_A.row, ctx.mat_A.col, ctx.mat_B.col, ctx.type, ctx.thread_idx, ctx.mat_A.ori_data, ctx.mat_B.ori_data, ctx.mat_A.ori_size, ctx.mat_B.ori_size);
 }
 
 ggml_rknpu2_matmul_kernel* ggml_rknpu2_matmul_kernel_create(const void* A_data, void* B_data, size_t A_size, size_t B_size, int m, int k, int n, rknn_matmul_type type, int core_number, int &initialized){
@@ -870,7 +977,7 @@ bool ggml_backend_is_rknn(ggml_backend_t backend){
     return backend != NULL && ggml_guid_matches(backend -> guid, ggml_backend_rknn_guid());
 }
 
-// MARK: rknn backend INIT
+// MARK: rknn INIT
 
 ggml_backend_t ggml_backend_rknn_init(void) {
     printf("@ggml-rknn.cpp\n");
@@ -908,27 +1015,6 @@ ggml_backend_t ggml_backend_rknn_init(void) {
             initialized);
     }
     
-    // matrix_ctx A = {1, 1536, NULL, "A"};
-    // matrix_ctx B = {1536, 151936, NULL, "B"};
-
-    // size_t matrix_A_size = A.row * A.col * sizeof(float16);
-    // size_t matrix_B_size = B.row * B.col * sizeof(float16);
-
-    // int initialized = 0;
-
-    // ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
-    //     A.data, 
-    //     B.data, 
-    //     matrix_A_size, 
-    //     matrix_B_size, 
-    //     A.row, 
-    //     A.col, 
-    //     B.col, 
-    //     RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
-    //     context->n_threads, 
-    //     initialized);
-
-
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */  ggml_backend_rknn_guid(),
         /* .interface = */  ggml_backend_rknn_i,
@@ -1155,6 +1241,7 @@ void second_split(int64_t dst_n, int64_t m, int64_t k, const void *A_data, int64
 void naive_split(int64_t row_end, int64_t row_start, int64_t m, int64_t k, const void *A_data, void *B_data, rknn_matmul_type type, int thread_idx, int64_t dst_n, ggml_tensor *dst);
 void side_matrix_mulmat_process(void *pad_A00, void *pad_B00, int &C_tile, const matrix_ctx &A00_ctx, const matrix_ctx &B00_ctx, rknn_matmul_type type, int thread_idx, ggml_tensor *dst, int64_t n, in_kernel_time &kernel_time, int id, int offset_col, int offset_row);
 void side_matrix_mulmat_process(void *pad_A00, void *pad_B00, int &C_tile, const matrix_ctx &A00_ctx, const matrix_ctx &B00_ctx, rknn_matmul_type type, int thread_idx, ggml_tensor *dst, int64_t n, in_kernel_time &kernel_time, int id, int offset_col, int offset_row, bool matrix_B00_need_set_io);
+void side_matrix_mulmat_process(matmul_ctx &A00_B00, ggml_tensor *dst, in_kernel_time &kernel_time, int offset_col, int offset_row, int & C_tile);
 
 // MARK: Matmul
 
@@ -1232,8 +1319,19 @@ void compute_submat_mul(int64_t m, // matrix A row
     matrix_ctx A_ctx = {A_row_00, A_col_00, pad_A00, "A"};
     matrix_ctx B_ctx = {B_row_00, B_col_00, pad_B00, "B"};
 
+    // mat_info mat_A = {A_row_00, A_col_00, FLOAT16, pad_A00, true};
+    // mat_info mat_B = {B_row_00, B_col_00, FLOAT16, pad_B00, false};
+    void ** ptr_pad_A00 = &pad_A00;
+    void ** ptr_pad_B00 = &pad_B00;
+    mat_info mat_A = mat_info(A_row_00, A_col_00, FLOAT16, ptr_pad_A00, true);
+    mat_info mat_B = mat_info(B_row_00, B_col_00, FLOAT16, ptr_pad_B00, false);
 
-    ggml_rknpu2_matmul_kernel * tmp_kernel = ggml_rknpu2_matmul_kernel_find(A_ctx, B_ctx, type, thread_idx);
+    
+    matmul_ctx A00_B00 = matmul_ctx(mat_A, mat_B, RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, thread_idx);
+
+    // ggml_rknpu2_matmul_kernel * tmp_kernel = ggml_rknpu2_matmul_kernel_find(A_ctx, B_ctx, type, thread_idx);
+    ggml_rknpu2_matmul_kernel * tmp_kernel = ggml_rknpu2_matmul_kernel_find(A00_B00);
+
 
     if(tmp_kernel != NULL) mat_A_mat_B_in_kernel = true;
     // printf("mat_A_mat_B_in_kernel: %d\n", mat_A_mat_B_in_kernel);   
@@ -1242,6 +1340,10 @@ void compute_submat_mul(int64_t m, // matrix A row
     if(A_row_00 != 0 && A_col_00 != 0){
         matrixA_to_perf_layout(A_data, pad_A00, A_row_00, A_col_00);
     }
+    // printf("pad_A00:\n");
+    // check_pad(A_row_00, A_col_00, pad_A00);
+    // printf("Check ori_data \n");
+    // check_pad(A_row_00, A_col_00, *(mat_A.ori_data));
 
     bool matrix_B00_need_set_io = true;
     if(B_row_00 != 0 && B_col_00 != 0){
@@ -1251,6 +1353,7 @@ void compute_submat_mul(int64_t m, // matrix A row
             // check if the it has been initialized
             // in matmul_kernel all B_data should has been converted to perf_layout
             // printf("tmp_kernel->B_data: %p, src1->data: %p\n", tmp_kernel->B_data, src1->data);
+            fixed_B00 = 1;
             if(tmp_kernel->B_data == src1->data){
                 // yes mat_B has been converted
                 pad_B00 = src1->extra;
@@ -1281,6 +1384,10 @@ void compute_submat_mul(int64_t m, // matrix A row
             printf("single_thread_duration: %ld us\n", single_thread_duration.count());
         }
     }
+    // printf("pad_B00:\n");
+    // check_pad(B_row_00, B_col_00, pad_B00);
+
+    A00_B00.matrix_B00_need_set_io = matrix_B00_need_set_io;
         
         // take A01 as an example
         // TODO: Abstract the code
@@ -1338,7 +1445,8 @@ void compute_submat_mul(int64_t m, // matrix A row
     matrix_ctx B11_ctx = {B_row_11, B_col_11, pad_B11, "B11"};
 
     int C_tile = 0;
-    side_matrix_mulmat_process(pad_A00, pad_B00, C_tile, A00_ctx, B00_ctx, type, thread_idx, dst, n, kernel_time, 1, 0, 0, matrix_B00_need_set_io);
+    // side_matrix_mulmat_process(pad_A00, pad_B00, C_tile, A00_ctx, B00_ctx, type, thread_idx, dst, n, kernel_time, 1, 0, 0, matrix_B00_need_set_io);
+    side_matrix_mulmat_process(A00_B00, dst, kernel_time, 0, 0, C_tile);
     side_matrix_mulmat_process(pad_A01, pad_B10, C_tile, A01_ctx, B10_ctx, type, thread_idx, dst, n, kernel_time, 2, 0, 0);
 
     C_tile = 1;
@@ -1381,15 +1489,201 @@ void compute_submat_mul(int64_t m, // matrix A row
 }
 
 
+void side_matrix_mulmat_process(matmul_ctx &A00_B00, ggml_tensor *dst, in_kernel_time &kernel_time, int offset_col, int offset_row, int & C_tile){
+    void *pad_A00 = *(A00_B00.mat_A.ori_data);
+    void *pad_B00 = *(A00_B00.mat_B.ori_data);
+    // printf("check pad_A00:\n");
+    // check_pad(A00_B00.mat_A.row, A00_B00.mat_A.col, pad_A00);
+
+    int thread_idx = A00_B00.thread_idx;
+
+    mat_info mat_A = A00_B00.mat_A;
+    mat_info mat_B = A00_B00.mat_B;
+
+    int64_t A_row_00 = mat_A.row;
+    int64_t A_col_00 = mat_A.col;
+    int64_t B_row_00 = mat_B.row;
+    int64_t B_col_00 = mat_B.col;
+
+    int64_t A_pad_row_00 = mat_A.pad_row;
+    int64_t A_pad_col_00 = mat_A.pad_col;
+    int64_t B_pad_row_00 = mat_B.pad_row;
+    int64_t B_pad_col_00 = mat_B.pad_col;
+    // printf("A_pad_row_00: %d, A_pad_col_00: %d, B_pad_row_00: %d, B_pad_col_00: %d\n", (int)A_pad_row_00, (int)A_pad_col_00, (int)B_pad_row_00, (int)B_pad_col_00);
+
+    int n = B_col_00;
+
+    size_t A_size = mat_A.pad_size;
+    size_t B_size = mat_B.pad_size;
+
+    rknn_matmul_type type = A00_B00.type;
+    bool matrix_B00_need_set_io = A00_B00.matrix_B00_need_set_io;
+
+    int initialized = 0;
+    int ret = 0;
+
+    // TODO: change the thread_idx 
+    auto create_kernel_start = std::chrono::high_resolution_clock::now();
+    // printf("start create kernel inside side_matrix_multiplication\n");
+    ggml_rknpu2_matmul_kernel *sub_kernel = ggml_rknpu2_matmul_kernel_create(pad_A00, pad_B00, A_size, B_size, A_pad_row_00, A_pad_col_00, B_pad_col_00, type, 1, initialized);
+    // printf("end create kernel inside side_matrix_multiplication\n");
+    auto create_kernel_end = std::chrono::high_resolution_clock::now();
+    auto create_kernel_duration = std::chrono::duration_cast<std::chrono::microseconds>(create_kernel_end - create_kernel_start).count();
+    kernel_time.find_kernel_time+= create_kernel_duration;
+    if (initialized == 0)
+    {
+        auto copy_to_mem_start = std::chrono::high_resolution_clock::now();
+        // for(int i = 0; i < A_pad_row_01; i++){
+        //     for(int j = 0; j < A_pad_col_01; j++){
+        //         ((rknpu2::float16*)sub_kernel->A->virt_addr)[i * A_pad_col_01 + j] = ((rknpu2::float16*)pad_A01)[i * A_pad_col_01 + j];
+        //         // printf("copying matrix A to sub_kernel->A->virt_addr: %d, %d\n", i, j);
+        //     }
+        // }
+        // printf("start memcpy A\n");
+        memcpy(sub_kernel->A->virt_addr, pad_A00, A_pad_row_00 * A_pad_col_00 * sizeof(rknpu2::float16));
+        // printf("A is copied\n");
+        // printf("sub_kernel->B_is_copied: %d\n", sub_kernel->B_is_copied);
+        if(!sub_kernel->B_is_copied){
+            // for(int i = 0; i < B_pad_row_10; i++){
+            //     for(int j = 0; j < B_pad_col_10; j++){
+            //         ((rknpu2::float16*)sub_kernel->B->virt_addr)[i * B_pad_col_10 + j] = ((rknpu2::float16*)pad_B10)[i * B_pad_col_10 + j];
+            //         // printf("copying matrix B to sub_kernel->B->virt_addr: %d, %d\n", i, j);
+            //     }
+            // }
+            // printf("start memcpy B\n");
+            memcpy(sub_kernel->B->virt_addr, pad_B00, B_pad_row_00 * B_pad_col_00 * sizeof(rknpu2::float16));
+            sub_kernel->B_is_copied = true;
+        }
+
+        auto copy_to_mem_end = std::chrono::high_resolution_clock::now();
+        auto copy_to_mem_duration = std::chrono::duration_cast<std::chrono::microseconds>(copy_to_mem_end - copy_to_mem_start).count();
+        kernel_time.memcpy_to_kernel_time += copy_to_mem_duration;
+    }
+    // printf("is initialized: %d\n", initialized);    
+
+    {
+        auto set_io_start = std::chrono::high_resolution_clock::now();
+        rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->A, &sub_kernel->io_attr.A);
+        if(matrix_B00_need_set_io)
+        {
+            rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->B, &sub_kernel->io_attr.B);
+        }
+        // rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->B, &sub_kernel->io_attr.B);
+        rknn_matmul_set_io_mem(sub_kernel->ctx, sub_kernel->C, &sub_kernel->io_attr.C);
+        auto set_io_end = std::chrono::high_resolution_clock::now();
+        auto set_io_duration = std::chrono::duration_cast<std::chrono::microseconds>(set_io_end - set_io_start).count();
+        kernel_time.set_io_time += set_io_duration;
+
+    }
+    // printf("set io done\n");
+
+    {
+        // printf("subkernel->A->virt_addr:\n");
+        // check_pad(A_row_00, A_col_00, sub_kernel->A->virt_addr);
+        // printf("subkernel->B->virt_addr:\n");
+        // check_pad(B_row_00, B_col_00, sub_kernel->B->virt_addr);
+        int64_t run_start = getCurrentTimeUs();
+        ret = rknn_matmul_run(sub_kernel->ctx);
+        int64_t run_end = getCurrentTimeUs();
+        int64_t run_duration = run_end - run_start;
+        kernel_time.run_time += run_duration;
+    }
+
+    {
+        void* norm_layout_C = malloc(A_row_00 * B_col_00 * sizeof(float));
+        perf_matrixC_to_norm_layout(sub_kernel->C->virt_addr, norm_layout_C, A_row_00, B_col_00);
+        // printf("norm_layout_C:\n");
+        // check_pad_float(A_row_00, B_col_00, norm_layout_C);
+        // printf("sub_kernel->C->virt_addr:\n");
+        // check_pad_float(A_row_00, B_col_00, sub_kernel->C->virt_addr);
+        auto sum_result_start = std::chrono::high_resolution_clock::now();
+        // printf("n: %d\n", n);
+        // printf("B_pad_col_00: %d\n", B_pad_col_00);
+        if (C_tile == 0)
+        {
+            for (int i = 0; i < A_row_00; i++)
+            {
+                for (int j = 0; j < B_col_00; j++)
+                {
+                    float* dst_data = (float *)dst->data + offset_col + offset_row * n;
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_00 + j];
+                }
+            }
+            // printf("id: %d\n", id);
+            // if(id == 2){
+            //     printf("A01 x B10\n");
+            // }
+            // A00xB00(A_row_01, B_col_10, dst, n);
+            // check_A00xB00_CPU(A_pad_row_01, B_pad_col_10, A_pad_col_01, pad_A01, pad_B10, (float *)sub_kernel->C->virt_addr, B_pad_col_10);
+        }
+        if (C_tile == 1){
+            float * dst_data = (float *)dst->data + offset_col + offset_row * n;
+            for (int i = 0; i < A_row_00; i++)
+            {
+                for (int j = 0; j < B_col_00; j++)
+                {
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_00 + j];
+                }
+            }
+            // if(id == 3){
+            //     printf("A00 x B01\n");
+            //     A00xB00(A_row_01, B_col_10, dst, n, offset_col, offset_row);
+            //     check_A00xB00_CPU(A_pad_row_01, B_pad_col_10, A_pad_col_01, pad_A01, pad_B10, (float *)sub_kernel->C->virt_addr, B_pad_col_10);
+            // }else if (id == 4) {
+            //     printf("A01 x B11\n");
+            //     A00xB00(A_row_01, B_col_10, dst, n, offset_col, offset_row);
+            //     check_A00xB00_CPU(A_pad_row_01, B_pad_col_10, A_pad_col_01, pad_A01, pad_B10, (float *)sub_kernel->C->virt_addr, B_pad_col_10);
+            // }
+        }
+        if (C_tile == 2){
+            float * dst_data = (float *)dst->data + offset_col + offset_row * n;
+            for (int i = 0; i < A_row_00; i++)
+            {
+                for (int j = 0; j < B_col_00; j++)
+                {
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_00 + j];
+                }
+            }
+            // if(id == 5){
+            //     printf("A10 x B00\n");
+            //     A00xB00(A_row_01, B_col_10, dst, n, offset_col, offset_row);
+            //     check_A00xB00_CPU(A_pad_row_01, B_pad_col_10, A_pad_col_01, pad_A01, pad_B10, (float *)sub_kernel->C->virt_addr, B_pad_col_10);
+            // }else if(id == 6) {
+            //     printf("A11 x B01\n");
+            //     A00xB00(A_row_01, B_col_10, dst, n, offset_col, offset_row);
+            //     check_A00xB00_CPU(A_pad_row_01, B_pad_col_10, A_pad_col_01, pad_A01, pad_B10, (float *)sub_kernel->C->virt_addr, B_pad_col_10);
+            // }
+        }
+
+        if (C_tile == 3){
+            float * dst_data = (float *)dst->data + offset_col + offset_row * n;
+            for (int i = 0; i < A_row_00; i++)
+            {
+                for (int j = 0; j < B_col_00; j++)
+                {
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_00 + j];
+                }
+            }
+            // if(id == 7){
+            //     printf("A10 x B01\n");
+            //     A00xB00(A_row_01, B_col_10, dst, n, offset_col, offset_row);
+            //     check_A00xB00_CPU(A_pad_row_01, B_pad_col_10, A_pad_col_01, pad_A01, pad_B10, (float *)sub_kernel->C->virt_addr, B_pad_col_10);
+            // }else if (id == 8) {
+            //     printf("A11 x B11\n");
+            //     A00xB00(A_row_01, B_col_10, dst, n, offset_col, offset_row);
+            //     check_A00xB00_CPU(A_pad_row_01, B_pad_col_10, A_pad_col_01, pad_A01, pad_B10, (float *)sub_kernel->C->virt_addr, B_pad_col_10);
+            // }
+        }
+        auto sum_result_end = std::chrono::high_resolution_clock::now();
+        auto sum_result_duration = std::chrono::duration_cast<std::chrono::microseconds>(sum_result_end - sum_result_start).count();
+        kernel_time.sum_result_time += sum_result_duration;
+    }
+}
 void side_matrix_mulmat_process(void *pad_A00, void *pad_B00, int &C_tile, const matrix_ctx &A00_ctx, const matrix_ctx &B00_ctx, rknn_matmul_type type, int thread_idx, ggml_tensor *dst, int64_t n, in_kernel_time &kernel_time, int id, int offset_col, int offset_row, bool matrix_B00_need_set_io){
     if (pad_A00 != nullptr && pad_B00 != nullptr)
     {
-        double tmp_kernel_runtime = 0;
-        tmp_kernel_runtime = kernel_time.run_time;
         side_matrix_multiplication(A00_ctx, B00_ctx, type, thread_idx, C_tile, dst, n, id, offset_col, offset_row, kernel_time, matrix_B00_need_set_io);
     }
-
-
 }
 void side_matrix_mulmat_process(void *pad_A00, void *pad_B00, int &C_tile, const matrix_ctx &A00_ctx, const matrix_ctx &B00_ctx, rknn_matmul_type type, int thread_idx, ggml_tensor *dst, int64_t n, in_kernel_time &kernel_time, int id, int offset_col, int offset_row) {
     side_matrix_mulmat_process(pad_A00, pad_B00, C_tile, A00_ctx, B00_ctx, type, thread_idx, dst, n, kernel_time, id, offset_col, offset_row, true);
@@ -1434,16 +1728,16 @@ void pad_side_matrix(const int64_t A_row_01, const int64_t A_col_01, const void 
 
 // MARK: side matmul
 
-void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, const int64_t B_row_10, const int64_t B_col_10, void *pad_A01, void *pad_B10, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row, in_kernel_time &kernel_time, bool matrix_B00_need_set_io)
+void side_matrix_multiplication(const int64_t A_row_00, const int64_t A_col_00, const int64_t B_row_00, const int64_t B_col_00, void *pad_A00, void *pad_B00, rknn_matmul_type type, int thread_idx, int &C_tile, ggml_tensor *dst, int64_t n, int id, int offset_col, int offset_row, in_kernel_time &kernel_time, bool matrix_B00_need_set_io)
 {
     // int A_pad_row_01 = A_row_01 < 32 ? 32 : A_row_01 / 32 * 32;
-    int A_pad_row_01 = A_row_01;
-    int A_pad_col_01 = A_col_01 < 32 ? 32 : A_col_01 / 32 * 32;
-    int B_pad_row_10 = B_row_10 < 32 ? 32 : B_row_10 / 32 * 32;
-    int B_pad_col_10 = B_col_10 < 32 ? 32 : B_col_10 / 32 * 32;
+    int A_pad_row_00 = A_row_00;
+    int A_pad_col_00 = A_col_00 < 32 ? 32 : A_col_00 / 32 * 32;
+    int B_pad_row_00 = B_row_00 < 32 ? 32 : B_row_00 / 32 * 32;
+    int B_pad_col_00 = B_col_00 < 32 ? 32 : B_col_00 / 32 * 32;
 
-    size_t A_size = A_pad_row_01 * A_pad_col_01 * sizeof(rknpu2::float16);
-    size_t B_size = B_pad_row_10 * B_pad_col_10 * sizeof(rknpu2::float16);
+    size_t A_size = A_pad_row_00 * A_pad_col_00 * sizeof(rknpu2::float16);
+    size_t B_size = B_pad_row_00 * B_pad_col_00 * sizeof(rknpu2::float16);
 
     int initialized = 0;
     int ret = 0;
@@ -1451,7 +1745,7 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
     // TODO: change the thread_idx 
     auto create_kernel_start = std::chrono::high_resolution_clock::now();
     // printf("start create kernel inside side_matrix_multiplication\n");
-    ggml_rknpu2_matmul_kernel *sub_kernel = ggml_rknpu2_matmul_kernel_create(pad_A01, pad_B10, A_size, B_size, A_pad_row_01, A_pad_col_01, B_pad_col_10, type, 1, initialized);
+    ggml_rknpu2_matmul_kernel *sub_kernel = ggml_rknpu2_matmul_kernel_create(pad_A00, pad_B00, A_size, B_size, A_pad_row_00, A_pad_col_00, B_pad_col_00, type, 1, initialized);
     // printf("end create kernel inside side_matrix_multiplication\n");
     auto create_kernel_end = std::chrono::high_resolution_clock::now();
     auto create_kernel_duration = std::chrono::duration_cast<std::chrono::microseconds>(create_kernel_end - create_kernel_start).count();
@@ -1465,7 +1759,7 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
         //         // printf("copying matrix A to sub_kernel->A->virt_addr: %d, %d\n", i, j);
         //     }
         // }
-        memcpy(sub_kernel->A->virt_addr, pad_A01, A_pad_row_01 * A_pad_col_01 * sizeof(rknpu2::float16));
+        memcpy(sub_kernel->A->virt_addr, pad_A00, A_pad_row_00 * A_pad_col_00 * sizeof(rknpu2::float16));
         // printf("A is copied\n");
         // printf("sub_kernel->B_is_copied: %d\n", sub_kernel->B_is_copied);
         if(!sub_kernel->B_is_copied){
@@ -1475,7 +1769,7 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
             //         // printf("copying matrix B to sub_kernel->B->virt_addr: %d, %d\n", i, j);
             //     }
             // }
-            memcpy(sub_kernel->B->virt_addr, pad_B10, B_pad_row_10 * B_pad_col_10 * sizeof(rknpu2::float16));
+            memcpy(sub_kernel->B->virt_addr, pad_B00, B_pad_row_00 * B_pad_col_00 * sizeof(rknpu2::float16));
             sub_kernel->B_is_copied = true;
         }
 
@@ -1508,19 +1802,20 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
     }
 
     {
-        void* norm_layout_C = malloc(A_row_01 * B_col_10 * sizeof(float));
-        perf_matrixC_to_norm_layout(sub_kernel->C->virt_addr, norm_layout_C, A_row_01, B_col_10);
+        void* norm_layout_C = malloc(A_row_00 * B_col_00 * sizeof(float));
+        perf_matrixC_to_norm_layout(sub_kernel->C->virt_addr, norm_layout_C, A_row_00, B_col_00);
         auto sum_result_start = std::chrono::high_resolution_clock::now();
         if (C_tile == 0)
         {
-            for (int i = 0; i < A_row_01; i++)
+            for (int i = 0; i < A_row_00; i++)
             {
-                for (int j = 0; j < B_col_10; j++)
+                for (int j = 0; j < B_col_00; j++)
                 {
                     float* dst_data = (float *)dst->data + offset_col + offset_row * n;
-                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_10 + j];
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_00 + j];
                 }
             }
+
             // printf("id: %d\n", id);
             // if(id == 2){
             //     printf("A01 x B10\n");
@@ -1530,11 +1825,11 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
         }
         if (C_tile == 1){
             float * dst_data = (float *)dst->data + offset_col + offset_row * n;
-            for (int i = 0; i < A_row_01; i++)
+            for (int i = 0; i < A_row_00; i++)
             {
-                for (int j = 0; j < B_col_10; j++)
+                for (int j = 0; j < B_col_00; j++)
                 {
-                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_10 + j];
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_00 + j];
                 }
             }
             // if(id == 3){
@@ -1549,11 +1844,11 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
         }
         if (C_tile == 2){
             float * dst_data = (float *)dst->data + offset_col + offset_row * n;
-            for (int i = 0; i < A_row_01; i++)
+            for (int i = 0; i < A_row_00; i++)
             {
-                for (int j = 0; j < B_col_10; j++)
+                for (int j = 0; j < B_col_00; j++)
                 {
-                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_10 + j];
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_00 + j];
                 }
             }
             // if(id == 5){
@@ -1569,11 +1864,11 @@ void side_matrix_multiplication(const int64_t A_row_01, const int64_t A_col_01, 
 
         if (C_tile == 3){
             float * dst_data = (float *)dst->data + offset_col + offset_row * n;
-            for (int i = 0; i < A_row_01; i++)
+            for (int i = 0; i < A_row_00; i++)
             {
-                for (int j = 0; j < B_col_10; j++)
+                for (int j = 0; j < B_col_00; j++)
                 {
-                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_10 + j];
+                    dst_data[i * n + j] += ((float *)norm_layout_C)[i * B_pad_col_00 + j];
                 }
             }
             // if(id == 7){
