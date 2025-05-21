@@ -1047,7 +1047,7 @@ ggml_backend_t ggml_backend_rknn_init(void) {
                 break;
             }
         }
-        if(B.col%48 == 0){
+        if(B.col%96 == 0){
             for(int i = 0 ; i < 3 ;i++){
                 ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
                     A.data, 
@@ -1062,8 +1062,24 @@ ggml_backend_t ggml_backend_rknn_init(void) {
                     initialized,
                     true);
             }
+            if(B.col < 10000){
+                for(int i = 0 ; i < 3 ;i++){
+                    ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
+                        A.data, 
+                        B.data, 
+                        matrix_A_size, 
+                        matrix_B_size, 
+                        A.row, 
+                        A.col, 
+                        B.col / 3, 
+                        RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
+                        i, 
+                        initialized,
+                        true);
+                }
+            }
         }
-        if(B.col%32 == 0){
+        if(B.col%64 == 0){
             for(int i = 0 ; i < 2 ;i++){
                 ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
                     A.data, 
