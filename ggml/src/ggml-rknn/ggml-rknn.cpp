@@ -725,10 +725,55 @@ static void ggml_backend_rknn_free(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+static bool has_init_kernel_from_file = false;
+
 void ggml_backend_rknn_set_n_threads(ggml_backend_t backend_rknn, int n_threads){
     GGML_ASSERT(ggml_backend_is_rknn(backend_rknn));
     ggml_backend_rknn_context * ctx = (ggml_backend_rknn_context *) backend_rknn -> context;
     ctx->n_threads = n_threads;
+   // printf("n_threads: %d\n", n_threads);
+    if(!has_init_kernel_from_file){
+
+        std::vector<matrixPair> matrix_pairs;
+        bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/deepseek-r1-qwen2-1.5B.json", matrix_pairs);
+        if(!status){
+            printf("read shape pairs from json failed!\n");
+            exit(-1);
+        }
+    
+        for(matrixPair &matrix_pair : matrix_pairs){
+            printf("matrix_pair: (%d, %d), (%d, %d)\n", matrix_pair.src0.row, matrix_pair.src0.col, matrix_pair.src1.row, matrix_pair.src1.col);
+            matrix_ctx A = {matrix_pair.src0.row, matrix_pair.src0.col, NULL, "A"};
+            matrix_ctx B = {matrix_pair.src1.row, matrix_pair.src1.col, NULL, "B"};
+            size_t matrix_A_size = A.row * A.col * sizeof(float16);
+            size_t matrix_B_size = B.row * B.col * sizeof(float16);
+            int initialized = 0;
+
+            int mod_number = 32 * n_threads;
+            if(B.col % mod_number == 0){
+                for(int i = 0 ; i < n_threads;i++){
+                            ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
+                            A.data, 
+                            B.data, 
+                            matrix_A_size, 
+                            matrix_B_size, 
+                            A.row, 
+                            A.col, 
+                            B.col / n_threads, 
+                            RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
+                            i, 
+                            initialized,
+                            true);
+                }
+            }
+        }
+        has_init_kernel_from_file = true;
+        for(int i = 0 ; i < matmul_kernels_count; i++){
+            printf("kernel %d:\n", i);
+            printf("dims: %d, %d, %d\n", matmul_kernels[i].info.M, matmul_kernels[i].info.K, matmul_kernels[i].info.N);
+        }
+    }
+    // printf("set n threads done\n");
 }
 
 static ggml_backend_i ggml_backend_rknn_i = {
@@ -1008,100 +1053,6 @@ ggml_backend_t ggml_backend_rknn_init(void) {
     printf("register the rknn!\n");
     ggml_backend_rknn_context * context = (ggml_backend_rknn_context *) malloc(sizeof(ggml_backend_rknn_context));
     printf("creating the backend!\n");
-
-    
-    std::vector<matrixPair> matrix_pairs;
-    bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/deepseek-r1-qwen2-1.5B.json", matrix_pairs);
-    if(!status){
-        printf("read shape pairs from json failed!\n");
-        return NULL;
-    }
-
-    for(matrixPair &matrix_pair : matrix_pairs){
-        printf("matrix_pair: (%d, %d), (%d, %d)\n", matrix_pair.src0.row, matrix_pair.src0.col, matrix_pair.src1.row, matrix_pair.src1.col);
-        matrix_ctx A = {matrix_pair.src0.row, matrix_pair.src0.col, NULL, "A"};
-        matrix_ctx B = {matrix_pair.src1.row, matrix_pair.src1.col, NULL, "B"};
-        size_t matrix_A_size = A.row * A.col * sizeof(float16);
-        size_t matrix_B_size = B.row * B.col * sizeof(float16);
-        int initialized = 0;
-        ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
-            A.data, 
-            B.data, 
-            matrix_A_size, 
-            matrix_B_size, 
-            A.row, 
-            A.col, 
-            B.col, 
-            RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
-            1, 
-            initialized);
-
-        int64_t m = B.col;
-        int64_t n_threads = 3;
-        int threads_number = 1;
-
-        for(int i = n_threads; i >= 1; i--){
-            if(m % (16 * i) != 0){
-                threads_number = i;
-            }else{
-                break;
-            }
-        }
-        if(B.col%96 == 0){
-            for(int i = 0 ; i < 3 ;i++){
-                ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
-                    A.data, 
-                    B.data, 
-                    matrix_A_size, 
-                    matrix_B_size, 
-                    A.row, 
-                    A.col, 
-                    B.col / 3, 
-                    RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
-                    i, 
-                    initialized,
-                    true);
-            }
-            if(B.col < 10000){
-                for(int i = 0 ; i < 3 ;i++){
-                    ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
-                        A.data, 
-                        B.data, 
-                        matrix_A_size, 
-                        matrix_B_size, 
-                        A.row, 
-                        A.col, 
-                        B.col / 3, 
-                        RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
-                        i, 
-                        initialized,
-                        true);
-                }
-            }
-        }
-        if(B.col%64 == 0){
-            for(int i = 0 ; i < 2 ;i++){
-                ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
-                    A.data, 
-                    B.data, 
-                    matrix_A_size, 
-                    matrix_B_size, 
-                    A.row, 
-                    A.col, 
-                    B.col / 2, 
-                    RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
-                    i, 
-                    initialized,
-                    true);
-            }
-        }
-
-
-        for(int i = 0 ; i < matmul_kernels_count; i++){
-            printf("kernel %d:\n", i);
-            printf("dims: %d, %d, %d\n", matmul_kernels[i].info.M, matmul_kernels[i].info.K, matmul_kernels[i].info.N);
-        }
-    }
     
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */  ggml_backend_rknn_guid(),
