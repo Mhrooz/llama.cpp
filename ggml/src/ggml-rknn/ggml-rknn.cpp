@@ -70,6 +70,9 @@ struct matrixPair{
     matrixShape src0;
     matrixShape src1;
 };
+
+std::vector<matrixPair> support_matrices;
+
 struct pad_data{
     void * data;
     bool is_padded=false;
@@ -735,7 +738,7 @@ void ggml_backend_rknn_set_n_threads(ggml_backend_t backend_rknn, int n_threads)
     if(!has_init_kernel_from_file){
 
         std::vector<matrixPair> matrix_pairs;
-        bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/deepseek-r1-qwen2-1.5B.json", matrix_pairs);
+        bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/mat_kernel_size.json", matrix_pairs);
         if(!status){
             printf("read shape pairs from json failed!\n");
             exit(-1);
@@ -750,21 +753,23 @@ void ggml_backend_rknn_set_n_threads(ggml_backend_t backend_rknn, int n_threads)
             int initialized = 0;
 
             int mod_number = 32 * n_threads;
-            if(B.col % mod_number == 0){
-                for(int i = 0 ; i < n_threads;i++){
-                            ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
-                            A.data, 
-                            B.data, 
-                            matrix_A_size, 
-                            matrix_B_size, 
-                            A.row, 
-                            A.col, 
-                            B.col / n_threads, 
-                            RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
-                            i, 
-                            initialized,
-                            true);
-                }
+            for(int i = 0 ; i < n_threads;i++){
+                    int split_B_col= B.col / 32 / 3 * 32;
+                    if(i == n_threads - 1)
+                        split_B_col = B.col - (n_threads - 1) * split_B_col;
+                    printf("split_B_col: %d, i: %d\n", split_B_col, i);
+                        ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
+                        A.data, 
+                        B.data, 
+                        matrix_A_size, 
+                        matrix_B_size, 
+                        A.row, 
+                        A.col, 
+                        split_B_col, 
+                        RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 
+                        i, 
+                        initialized,
+                        true);
             }
         }
         has_init_kernel_from_file = true;
@@ -906,16 +911,16 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                 result = false;
             }
 
-            std::vector<matrixPair> matrix_pairs;
-            bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/deepseek-r1-qwen2-1.5B.json", matrix_pairs);
-            if(!status){
-                printf("read shape pairs from json failed!\n");
-                return NULL;
-            }
+            // std::vector<matrixPair> matrix_pairs;
+            // bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/deepseek-r1-qwen2-1.5B.json", matrix_pairs);
+            // if(!status){
+            //     printf("read shape pairs from json failed!\n");
+            //     return NULL;
+            // }
             result = false;
             // printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, ne0: %d, ne1: %d\n", (int)ne00, (int)ne01, (int)ne10, (int)ne11, (int)ne0, (int)ne1);
 
-            for(matrixPair &matrix_pair : matrix_pairs){
+            for(matrixPair &matrix_pair : support_matrices){
                 matrix_ctx A = {matrix_pair.src0.row, matrix_pair.src0.col, NULL, "A"};
                 matrix_ctx B = {matrix_pair.src1.row, matrix_pair.src1.col, NULL, "B"};
                 if(A.row == ne11 && A.col == ne10 && B.row == ne00 && B.col == ne01){
@@ -1054,6 +1059,7 @@ ggml_backend_t ggml_backend_rknn_init(void) {
     ggml_backend_rknn_context * context = (ggml_backend_rknn_context *) malloc(sizeof(ggml_backend_rknn_context));
     printf("creating the backend!\n");
     
+
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */  ggml_backend_rknn_guid(),
         /* .interface = */  ggml_backend_rknn_i,
@@ -1062,61 +1068,71 @@ ggml_backend_t ggml_backend_rknn_init(void) {
     };
     printf("done!\n");
 
-    return backend;
-}
-
-// if the mul mat type is f16 x f16 = f32
-static bool ggml_rk_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst) {
-
-    const int64_t ne00 = src0->ne[0]; // k
-    const int64_t ne01 = src0->ne[1]; // m
-    const int64_t ne10 = src1->ne[0]; // k
-    const int64_t ne11 = src1->ne[1]; // n
-    const int64_t ne0 = dst->ne[0]; // m
-    const int64_t ne1 = dst->ne[1]; // n
-
-    // printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, ne0: %d, ne1: %d\n", (int)ne00, (int)ne01, (int)ne10, (int)ne11, (int)ne0, (int)ne1);
-    //ne00: 960, ne01: 1, ne10: 960, ne11: 2880, ne0: 1, ne1: 2880
-
-
-    // if(ne00 %32 != 0 || ne11%32 != 0){
-    //     return false;
-    // }
-
-    if(dst->type != GGML_TYPE_F32){
-        return false;
-    }
-        std::vector<matrixPair> matrix_pairs;
-    bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/deepseek-r1-qwen2-1.5B.json", matrix_pairs);
+    bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/mat_kernel_size.json", support_matrices);
     if(!status){
         printf("read shape pairs from json failed!\n");
         return NULL;
     }
+    // printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, ne0: %d, ne1: %d\n", (int)ne00, (int)ne01, (int)ne10, (int)ne11, (int)ne0, (int)ne1);
 
-    bool pre_created = false;
-    for(matrixPair &matrix_pair : matrix_pairs){
-        // printf("can mul mat matrix_pair: (%d, %d), (%d, %d)\n", matrix_pair.src0.row, matrix_pair.src0.col, matrix_pair.src1.row, matrix_pair.src1.col);
-        matrix_ctx A = {matrix_pair.src0.row, matrix_pair.src0.col, NULL, "A"};
-        matrix_ctx B = {matrix_pair.src1.row, matrix_pair.src1.col, NULL, "B"};
-        if(A.row == ne11 && A.col == ne10 && B.row == ne00 && B.col == ne01){
-            pre_created = true;
-            break;
-        }
-    }
-    // if(pre_created){printf("running on rknn\n");}
-    // else{printf("running on cpu\n");}
-    return pre_created;
-    // return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
-    //         (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
-    //          dst->type == GGML_TYPE_F32 &&
-    //          //(ne0 % 32 == 0 && ne1 % 32 == 0) &&
-    //         //  (ne1 % 32 == 0) &&
-    //         // (ne0 >= 1 && ne1 >= 32 && ne10 >= 32);
-    //         (ne0 >= 1 && ne1 >= 1 && ne10 >= 1);
-    //         //(ne0 >= 32 && ne1 >= 32 && ne10 >= 32);
-    return true;
+    
 
+
+    return backend;
 }
+
+// if the mul mat type is f16 x f16 = f32
+// static bool ggml_rk_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst) {
+
+//     const int64_t ne00 = src0->ne[0]; // k
+//     const int64_t ne01 = src0->ne[1]; // m
+//     const int64_t ne10 = src1->ne[0]; // k
+//     const int64_t ne11 = src1->ne[1]; // n
+//     const int64_t ne0 = dst->ne[0]; // m
+//     const int64_t ne1 = dst->ne[1]; // n
+
+//     // printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, ne0: %d, ne1: %d\n", (int)ne00, (int)ne01, (int)ne10, (int)ne11, (int)ne0, (int)ne1);
+//     //ne00: 960, ne01: 1, ne10: 960, ne11: 2880, ne0: 1, ne1: 2880
+
+
+//     // if(ne00 %32 != 0 || ne11%32 != 0){
+//     //     return false;
+//     // }
+
+//     if(dst->type != GGML_TYPE_F32){
+//         return false;
+//     }
+//         std::vector<matrixPair> matrix_pairs;
+//     bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/deepseek-r1-qwen2-1.5B.json", matrix_pairs);
+//     if(!status){
+//         printf("read shape pairs from json failed!\n");
+//         return NULL;
+//     }
+
+//     bool pre_created = false;
+//     for(matrixPair &matrix_pair : matrix_pairs){
+//         // printf("can mul mat matrix_pair: (%d, %d), (%d, %d)\n", matrix_pair.src0.row, matrix_pair.src0.col, matrix_pair.src1.row, matrix_pair.src1.col);
+//         matrix_ctx A = {matrix_pair.src0.row, matrix_pair.src0.col, NULL, "A"};
+//         matrix_ctx B = {matrix_pair.src1.row, matrix_pair.src1.col, NULL, "B"};
+//         if(A.row == ne11 && A.col == ne10 && B.row == ne00 && B.col == ne01){
+//             pre_created = true;
+//             break;
+//         }
+//     }
+//     // if(pre_created){printf("running on rknn\n");}
+//     // else{printf("running on cpu\n");}
+//     return pre_created;
+//     // return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
+//     //         (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+//     //          dst->type == GGML_TYPE_F32 &&
+//     //          //(ne0 % 32 == 0 && ne1 % 32 == 0) &&
+//     //         //  (ne1 % 32 == 0) &&
+//     //         // (ne0 >= 1 && ne1 >= 32 && ne10 >= 32);
+//     //         (ne0 >= 1 && ne1 >= 1 && ne10 >= 1);
+//     //         //(ne0 >= 32 && ne1 >= 32 && ne10 >= 32);
+//     return true;
+
+// }
 
 
 // static struct ggml_rknpu2_matmul_kernel * ggml_rknpu2_matmul_kernel_find(int m, int k, int n, rknn_matmul_type type, int thread_idx, rknpu2::float16 * A_data, rknpu2::float16 * B_data, size_t A_size, size_t B_size) {
@@ -2211,6 +2227,9 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src0, ggml_ten
         // int64_t col_end = (t + 1) * n / n_threads;
         int64_t col_start = t * m / threads_number;
         int64_t col_end = (t + 1) * m / threads_number;
+        if (col_end > m){
+            col_end = m;
+        }
         int64_t sub_n = col_end - col_start;
 
         // void * A_compute_data = A_data;
@@ -2225,8 +2244,6 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src0, ggml_ten
             int64_t dst_n = dst->ne[1];
             // printf("dst_n: %d\n", dst_n);
 
-            // compute_submat_mul(dst_n,pad_k, B_compute_data, A_transposed_data, dst, col_start, col_end, t, inference_type, m, k);
-            // compute_submat_mul(m,pad_k, A_compute_data, B_compute_data, dst, col_start, col_end, t, inference_type, dst_n, k, src0, src1);
             compute_submat_mul(dst_n,pad_k, B_compute_data, A_compute_data, dst, col_start, col_end, t, inference_type, m, k, src1, src0);
         });
     }
@@ -2242,14 +2259,6 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src0, ggml_ten
     }
     end = std::chrono::high_resolution_clock::now();
     duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    // printf("waiting computation time: %lld\n", duration.count());
-
-    // if(m != 1){
-    //     free(A_transposed_data);
-    // }
-
-    // free(B_transposed_data);
-
 }
 
 typedef void (*ggml_rk_func_t)(ggml_backend_t backend, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst, rknn_matmul_type type);
@@ -2260,31 +2269,15 @@ bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
     ggml_tensor * src0 = tensor->src[0];
     ggml_tensor * src1 = tensor->src[1];
 
-    //check src0 and src1 data
-    // printf("src0 data, src0->ne[1]: %d, src0->ne[0]: %d\n", (int)src0->ne[1], (int)src0->ne[0]);
-    // for(int i = 0; i < src0->ne[1]; i++){
-    //     for(int j = 0; j < src0->ne[0]; j++){
-    //         printf("%2.f ", float(((rknpu2::float16*)src0->data)[i * src0->ne[0] + j]));
-    //     }
-    //     printf("\n");
-    // }
-
-    // printf("src1 data, src1->ne[1]: %d, src1->ne[0]: %d\n", src1->ne[1], src1->ne[0]);
-    // for(int i = 0; i < src1->ne[1]; i++){
-    //     for(int j = 0; j < src1->ne[0]; j++){
-    //         printf("%2.f ", float(((rknpu2::float16*)src1->data)[i * src1->ne[0] + j]));
-    //     }
-    //     printf("\n");
-    // }
-
     const bool any_on_device = tensor->extra
         || (src0 != nullptr && src0->extra)
         || (src1 != nullptr && src1->extra);
 
     if(tensor->op == GGML_OP_MUL_MAT){
-        if(!any_on_device && !ggml_rk_can_mul_mat(tensor->src[0], tensor->src[1], tensor)){
-            return false;
-        }
+        // if(!any_on_device && !ggml_rk_can_mul_mat(tensor->src[0], tensor->src[1], tensor)){
+        // if(!any_on_device ){
+        //     return false;
+        // }
         func = ggml_rk_mul_mat;
     }
     else{
