@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
@@ -685,7 +686,23 @@ rknn_tensor_type rknpu2_matmul_input_type_to_output_type(rknn_tensor_type type)
             GGML_ASSERT(0);
     }
 }
+
+static inline struct timespec * timespec_sub(const struct timespec *ts_a, const struct timespec *ts_b, struct timespec * ts_out){
+    ts_out->tv_sec = ts_a->tv_sec - ts_b->tv_sec;
+    ts_out->tv_nsec = ts_a->tv_nsec - ts_b->tv_nsec;
+    if (ts_out->tv_nsec < 0) {
+        ts_out->tv_sec--;
+        ts_out->tv_nsec += 1000000000;
+    }
+    return ts_out;
+}
+
+static inline unsigned long long timespec_ns(const struct timespec * ts){
+    return (unsigned long long)ts->tv_sec * 1000000000ull + (unsigned long long)ts->tv_nsec;
+}
+
 static ggml_status ggml_backend_rknn_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    // printf("rknn graph compute!!!!!!!!\n");
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
@@ -693,11 +710,21 @@ static ggml_status ggml_backend_rknn_graph_compute(ggml_backend_t backend, ggml_
             continue;
         }
 
+        struct timespec start_compute_forward;
+        clock_gettime(CLOCK_MONOTONIC, &start_compute_forward);
         bool ok = ggml_rk_compute_forward(backend, node);
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
+        struct timespec end_compute_forward;
+        clock_gettime(CLOCK_MONOTONIC, &end_compute_forward);
+
+        printf("Node %d: %s (%s) compute time: %llu ns\n", i, node->name, ggml_op_name(node->op), timespec_ns(timespec_sub(&end_compute_forward, &start_compute_forward, &end_compute_forward)));
+
+
         GGML_ASSERT(ok);
+
+
     }
 
     return GGML_STATUS_SUCCESS;
@@ -739,6 +766,7 @@ void ggml_backend_rknn_set_n_threads(ggml_backend_t backend_rknn, int n_threads)
 
         std::vector<matrixPair> matrix_pairs;
         bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/mat_kernel_size.json", matrix_pairs);
+        // bool status = true;
         if(!status){
             printf("read shape pairs from json failed!\n");
             exit(-1);
@@ -888,6 +916,7 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
 
         case GGML_OP_MUL_MAT:
         {
+            // printf("op->name: %s\n", op->name);
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
             const struct ggml_tensor * dst = op;
@@ -898,27 +927,14 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
             const int64_t ne0 = dst->ne[0]; // m
             const int64_t ne1 = dst->ne[1]; // n
 
-            //ne00: 960, ne01: 1, ne10: 960, ne11: 2880, ne0: 1, ne1: 2880
 
             bool result = true;
-
-            // if(ne00 %32 != 0 || ne11%32 != 0){
-            //     printf("ne00 %d %% 32 != 0 || ne11 %d %% 32 != 0\n", (int)ne00, (int)ne11);
-            //     result = false;
-            // }
 
             if(dst->type != GGML_TYPE_F32){
                 result = false;
             }
-
-            // std::vector<matrixPair> matrix_pairs;
-            // bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/deepseek-r1-qwen2-1.5B.json", matrix_pairs);
-            // if(!status){
-            //     printf("read shape pairs from json failed!\n");
-            //     return NULL;
-            // }
             result = false;
-            // printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, ne0: %d, ne1: %d\n", (int)ne00, (int)ne01, (int)ne10, (int)ne11, (int)ne0, (int)ne1);
+
 
             for(matrixPair &matrix_pair : support_matrices){
                 matrix_ctx A = {matrix_pair.src0.row, matrix_pair.src0.col, NULL, "A"};
@@ -928,29 +944,28 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                     break;
                 }
             }
+            if(result == true){
+                printf("ne00: %ld, ne01: %ld, ne10: %ld, ne11: %ld, ne0: %ld, ne1: %ld\n", ne00, ne01, ne10, ne11, ne0, ne1);
+
+                if(ne01 == 8192){
+                        // printf("op->name: %s\n", op->name);
+                        // printf("match: ffn_up-0: %d\n", std::strcmp(op->name, "ffn_up-0") );
+                    // const char * pos = std::strstr(op->name, "ffn_up-1");
+                    // printf("op->name: %s\n", op->name);
+                    // printf("pos: %s\n", pos);
+                    if(op->name != NULL && std::strcmp(op->name, "ffn_out-1") == 0) {
+                    // if(op->name != NULL && pos) {
+                        return true;
+                    }
+                    else{
+                        return false;
+                    }
+                }
+                // printf("op->name: %s\n", op->name);
+            }
 
             return result;
 
-
-            // BLAS usually is only faster for large matrices
-            // const struct ggml_tensor * src0 = op->src[0];
-            // const struct ggml_tensor * src1 = op->src[1];
-
-            // const int64_t ne10 = src1->ne[0];
-
-            // const int64_t ne0 = op->ne[0];
-            // const int64_t ne1 = op->ne[1];
-
-            // TODO: find the optimal value
-            // const int64_t min_batch = 32;
-
-            // bool result = ggml_is_contiguous(src0) &&
-            //        ggml_is_contiguous(src1) &&
-            //        src1->type == GGML_TYPE_F16 &&
-            //        (ne0 >= min_batch && ne1 >= min_batch && ne10 >= min_batch) &&
-            //        (src0->type == GGML_TYPE_F16 || ggml_get_type_traits(src0->type)->to_float != NULL);
-            // printf("result = %d\n", result);
-            // return result;
         }
 
         default:
@@ -1069,6 +1084,7 @@ ggml_backend_t ggml_backend_rknn_init(void) {
     printf("done!\n");
 
     bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/mat_kernel_size.json", support_matrices);
+    // bool status = true;
     if(!status){
         printf("read shape pairs from json failed!\n");
         return NULL;
@@ -1336,6 +1352,7 @@ void compute_submat_mul(int64_t m, // matrix A row
 {
     bool split_matrix= false;
     bool second_split_flag = false;
+    // printf("row_end: %ld, row_start: %ld, m: %ld, k: %ld, dst_n: %ld\n", row_end, row_start, m, k, dst_n);
     int64_t n = row_end - row_start;
     // int64_t k = ori_k;
     k = ori_k;
@@ -1505,7 +1522,10 @@ void compute_submat_mul(int64_t m, // matrix A row
     int C_tile = 0;
     // side_matrix_mulmat_process(pad_A00, pad_B00, C_tile, A00_ctx, B00_ctx, type, thread_idx, dst, n, kernel_time, 1, 0, 0, matrix_B00_need_set_io);
 
-    side_matrix_mulmat_process(A00_B00, dst, kernel_time, thread_idx * n, 0, C_tile);
+    // printf("A00_B00: %d, %d, %d, %d\n", (int)A_row_00, (int)A_col_00, (int)B_row_00, (int)B_col_00);
+
+
+    side_matrix_mulmat_process(A00_B00, dst, kernel_time, row_start, 0, C_tile);
 
     {
         // side_matrix_mulmat_process(pad_A01, pad_B10, C_tile, A01_ctx, B10_ctx, type, thread_idx, dst, n, kernel_time, 2, 0, 0);
@@ -1615,6 +1635,7 @@ void side_matrix_mulmat_process(matmul_ctx &A00_B00, ggml_tensor *dst, in_kernel
             // }
             // printf("pad_b00\n");
             // check_pad(B_row_00, B_col_00, pad_B00);
+            // printf("B_pad_row_00: %d, B_pad_col_00: %d\n", (int)B_pad_row_00, (int)B_pad_col_00);
             memcpy(sub_kernel->B->virt_addr, pad_B00, B_pad_row_00 * B_pad_col_00 * sizeof(rknpu2::float16));
                         sub_kernel->B_is_copied = true;
             sub_kernel->B_data = pad_B00;
@@ -1671,6 +1692,9 @@ void side_matrix_mulmat_process(matmul_ctx &A00_B00, ggml_tensor *dst, in_kernel
         // printf("B_pad_col_00: %d\n", B_pad_col_00);
         if (C_tile == 0)
         {
+            // printf("offset_col: %d", offset_col);
+            // printf("dst->data: %p\n", dst->data);
+            // printf("dst->ne[0]: %d, dst->ne[1]: %d\n", dst->ne[0], dst->ne[1]);
             for (int i = 0; i < A_row_00; i++)
             {
                 for (int j = 0; j < B_col_00; j++)
@@ -1795,6 +1819,7 @@ void side_matrix_multiplication(const int64_t A_row_00, const int64_t A_col_00, 
         // printf("A is copied\n");
         // printf("sub_kernel->B_is_copied: %d\n", sub_kernel->B_is_copied);
         if(!sub_kernel->B_is_copied){
+            printf("B_is_copied is false, copying B to sub_kernel->B->virt_addr\n");
             // for(int i = 0; i < B_pad_row_10; i++){
             //     for(int j = 0; j < B_pad_col_10; j++){
             //         ((rknpu2::float16*)sub_kernel->B->virt_addr)[i * B_pad_col_10 + j] = ((rknpu2::float16*)pad_B10)[i * B_pad_col_10 + j];
@@ -2189,7 +2214,11 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src0, ggml_ten
     start = std::chrono::high_resolution_clock::now();
 
     void * A_data = src0->data;
-    void * B_data = src1->data;
+    void * B_data_f32 = src1->data;
+    void * B_data = malloc(n * k * sizeof(rknpu2::float16));
+    for(int i = 0 ; i < n * k ; i++)
+        ((rknpu2::float16 *)B_data)[i] = GGML_FP32_TO_FP16(((float *)B_data_f32)[i]);
+
 
     // printf("A_data: %p, B_data: %p\n", A_data, B_data);
     // check_pad(m, k, A_data);
@@ -2225,8 +2254,8 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src0, ggml_ten
     for(int t = 0; t < threads_number; t++){
         // int64_t col_start = t * n / n_threads;
         // int64_t col_end = (t + 1) * n / n_threads;
-        int64_t col_start = t * m / threads_number;
-        int64_t col_end = (t + 1) * m / threads_number;
+        int64_t col_start = t * m / threads_number / 32 * 32;
+        int64_t col_end = (t + 1) * m / threads_number / 32 * 32;
         if (col_end > m){
             col_end = m;
         }
@@ -2264,6 +2293,7 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src0, ggml_ten
 typedef void (*ggml_rk_func_t)(ggml_backend_t backend, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst, rknn_matmul_type type);
 
 bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor) {
+    // printf("Timestamp: %lld, start ggml_rk_compute_forward called for tensor\n",getCurrentTimeUs());
     ggml_rk_func_t func = nullptr;
 
     ggml_tensor * src0 = tensor->src[0];
@@ -2296,6 +2326,8 @@ bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
     func(backend, tensor->src[0], tensor->src[1], tensor, matmul_type);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    // printf("Timestamp: %lld, end ggml_rk_compute_forward called for tensor\n",getCurrentTimeUs());
     // printf("total time: %lld\n", duration.count());
     return true;
 }

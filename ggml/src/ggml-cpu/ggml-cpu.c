@@ -8712,14 +8712,14 @@ static void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-    FILE *fp = fopen("src0_src1_shape_cpu.txt", "a");
-    if (fp == NULL) {
-        printf("Error opening file!\n");
-        return false;
-    }
-    fprintf(fp, "src0 shape: %lld %lld, data address: %p\n", src0->ne[0], src0->ne[1], src0->data);
-    fprintf(fp, "src1 shape: %lld %lld, data address: %p\n", src1->ne[0], src1->ne[1], src1->data);
-    fclose(fp);
+    // FILE *fp = fopen("src0_src1_shape_cpu.txt", "a");
+    // if (fp == NULL) {
+    //     printf("Error opening file!\n");
+    //     return false;
+    // }
+    // fprintf(fp, "src0 shape: %lld %lld, data address: %p\n", src0->ne[0], src0->ne[1], src0->data);
+    // fprintf(fp, "src1 shape: %lld %lld, data address: %p\n", src1->ne[0], src1->ne[1], src1->data);
+    // fclose(fp);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
