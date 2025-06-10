@@ -416,6 +416,9 @@ void llama_context::synchronize() {
             t_eval_us += ggml_time_us() - t_compute_start_us;
         }
         n_eval++;
+        if (n_eval > 1){
+            t_from_2nd_us += ggml_time_us() - t_compute_start_us;
+        }
     } else if (n_queued_tokens > 1) {
         if (!cparams.no_perf) {
             t_p_eval_us += ggml_time_us() - t_compute_start_us;
@@ -2266,6 +2269,7 @@ llama_perf_context_data llama_context::perf_get_data() const {
     data.t_load_ms   = 1e-3 * t_load_us;
     data.t_p_eval_ms = 1e-3 * t_p_eval_us;
     data.t_eval_ms   = 1e-3 * t_eval_us;
+    data.t_from_2nd_ms = 1e-3 * t_from_2nd_us;
     data.n_p_eval    = std::max(1, n_p_eval);
     data.n_eval      = std::max(1, n_eval);
 
@@ -2840,6 +2844,11 @@ void llama_perf_context_print(const llama_context * ctx) {
     LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
+
+   LLAMA_LOG_INFO("%s:        from 2nd token eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
+            __func__, data.t_from_2nd_ms, data.n_eval, data.t_from_2nd_ms / data.n_eval, 1e3 / data.t_from_2nd_ms * data.n_eval);
+  
+ 
 }
 
 void llama_perf_context_reset(llama_context * ctx) {
