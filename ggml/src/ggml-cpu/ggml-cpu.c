@@ -30,6 +30,8 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <string.h>
+
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
@@ -15443,7 +15445,19 @@ struct ggml_cplan ggml_graph_plan(
 
     return cplan;
 }
+static inline struct timespec * timespec_sub(const struct timespec *ts_a, const struct timespec *ts_b, struct timespec * ts_out){
+    ts_out->tv_sec = ts_a->tv_sec - ts_b->tv_sec;
+    ts_out->tv_nsec = ts_a->tv_nsec - ts_b->tv_nsec;
+    if (ts_out->tv_nsec < 0) {
+        ts_out->tv_sec--;
+        ts_out->tv_nsec += 1000000000;
+    }
+    return ts_out;
+}
 
+static inline unsigned long long timespec_ns(const struct timespec * ts){
+    return (unsigned long long)ts->tv_sec * 1000000000ull + (unsigned long long)ts->tv_nsec;
+}
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -15464,7 +15478,22 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
+        // char * pos = strstr(node->name, "ffn_out-2");
+        // struct timespec start_compute_forward;
+
+        // if(pos)
+          //   clock_gettime(CLOCK_MONOTONIC, &start_compute_forward);
+
         ggml_compute_forward(&params, node);
+
+        // struct timespec end_compute_forward;
+       //  if(pos)
+         //    clock_gettime(CLOCK_MONOTONIC, &end_compute_forward);
+
+
+        // if(pos && node->op == GGML_OP_MUL_MAT){
+            // printf("Node :%s (%s) compute time: %llu ns\n", node->name, ggml_op_name(node->op), timespec_ns(timespec_sub(&end_compute_forward, &start_compute_forward, &end_compute_forward)));
+         // }
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
