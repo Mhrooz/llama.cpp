@@ -745,56 +745,7 @@ void ggml_backend_rknn_set_n_threads(ggml_backend_t backend_rknn, int n_threads)
     ggml_backend_rknn_context * ctx = (ggml_backend_rknn_context *) backend_rknn -> context;
     ctx->n_threads = n_threads;
    // printf("n_threads: %d\n", n_threads);
-    if(!has_init_kernel_from_file){
 
-        std::vector<matrixPair> matrix_pairs;
-        bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/mat_kernel_size.json", matrix_pairs);
-        // bool status = true;
-        if(!status){
-            printf("read shape pairs from json failed!\n");
-            exit(-1);
-        }
-
-        for(matrixPair &matrix_pair : matrix_pairs){
-            printf("matrix_pair: (%d, %d), (%d, %d)\n", matrix_pair.src0.row, matrix_pair.src0.col, matrix_pair.src1.row, matrix_pair.src1.col);
-            matrix_ctx A = {matrix_pair.src0.row, matrix_pair.src0.col, NULL, "A"};
-            matrix_ctx B = {matrix_pair.src1.row, matrix_pair.src1.col, NULL, "B"};
-            size_t matrix_A_size = A.row * A.col * sizeof(float16);
-            size_t matrix_B_size = B.row * B.col * sizeof(float16);
-            int initialized = 0;
-
-            int mod_number = 32 * n_threads;
-            printf("matrix_pair.name.c_str(): %s\n", matrix_pair.name.c_str());
-            for(int i = 0 ; i < n_threads;i++){
-                    int split_B_col= B.col / 32 / 3 * 32;
-                    if(i == n_threads - 1)
-                        split_B_col = B.col - (n_threads - 1) * split_B_col;
-                    char * op_name = (char*)malloc(sizeof(char) * matrix_pair.name.length());
-                    for(int j = 0 ; j <matrix_pair.name.length();j++){
-                        op_name[j] = matrix_pair.name[j];
-                    }
-                    ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
-                    A.data,
-                    B.data,
-                    matrix_A_size,
-                    matrix_B_size,
-                    A.row,
-                    A.col,
-                    split_B_col,
-                    RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-                    i,
-                    initialized,
-                    true,
-                    op_name
-                );
-            }
-        }
-        has_init_kernel_from_file = true;
-        for(int i = 0 ; i < matmul_kernels_count; i++){
-            printf("kernel %d:\n", i);
-            printf("dims: %d, %d, %d, kernel->name: %s\n", matmul_kernels[i].info.M, matmul_kernels[i].info.K, matmul_kernels[i].info.N, matmul_kernels[i].name);
-        }
-    }
     // printf("set n threads done\n");
 }
 
@@ -895,6 +846,7 @@ static ggml_backend_buffer_t ggml_backend_rknn_device_buffer_from_host_ptr(ggml_
 }
 static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
 
+    // printf("%s ", ggml_op_name(op->op));
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -924,7 +876,6 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
             }
             result = false;
 
-            // printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d\n", ne00, ne01, ne10, ne11);
             for(matrixPair &matrix_pair : support_matrices){
                 matrix_ctx A = {matrix_pair.src0.row, matrix_pair.src0.col, NULL, matrix_pair.name.c_str()};
                 matrix_ctx B = {matrix_pair.src1.row, matrix_pair.src1.col, NULL, matrix_pair.name.c_str()};
@@ -936,6 +887,8 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                     break;
                 }
             }
+            // if(result == true)
+                // printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, op->name: %s, result: %d\n", ne00, ne01, ne10, ne11, op->name, result);
             return result;
 
         }
@@ -1045,7 +998,57 @@ ggml_backend_t ggml_backend_rknn_init(void) {
     printf("register the rknn!\n");
     ggml_backend_rknn_context * context = (ggml_backend_rknn_context *) malloc(sizeof(ggml_backend_rknn_context));
     printf("creating the backend!\n");
+    int n_threads = 3;
+    if(!has_init_kernel_from_file){
 
+        std::vector<matrixPair> matrix_pairs;
+        bool status = read_shape_pairs_from_json(std::string(CONFIG_DIR) + "/mat_kernel_size.json", matrix_pairs);
+        // bool status = true;
+        if(!status){
+            printf("read shape pairs from json failed!\n");
+            exit(-1);
+        }
+
+        for(matrixPair &matrix_pair : matrix_pairs){
+            printf("matrix_pair: (%d, %d), (%d, %d)\n", matrix_pair.src0.row, matrix_pair.src0.col, matrix_pair.src1.row, matrix_pair.src1.col);
+            matrix_ctx A = {matrix_pair.src0.row, matrix_pair.src0.col, NULL, "A"};
+            matrix_ctx B = {matrix_pair.src1.row, matrix_pair.src1.col, NULL, "B"};
+            size_t matrix_A_size = A.row * A.col * sizeof(float16);
+            size_t matrix_B_size = B.row * B.col * sizeof(float16);
+            int initialized = 0;
+
+            int mod_number = 32 * n_threads;
+            printf("matrix_pair.name.c_str(): %s\n", matrix_pair.name.c_str());
+            for(int i = 0 ; i < n_threads;i++){
+                    int split_B_col= B.col / 32 / 3 * 32;
+                    if(i == n_threads - 1)
+                        split_B_col = B.col - (n_threads - 1) * split_B_col;
+                    char * op_name = (char*)malloc(sizeof(char) * matrix_pair.name.length());
+                    for(int j = 0 ; j <matrix_pair.name.length();j++){
+                        op_name[j] = matrix_pair.name[j];
+                    }
+                    ggml_rknpu2_matmul_kernel * kernel = ggml_rknpu2_matmul_kernel_create(
+                    A.data,
+                    B.data,
+                    matrix_A_size,
+                    matrix_B_size,
+                    A.row,
+                    A.col,
+                    split_B_col,
+                    RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
+                    i,
+                    initialized,
+                    true,
+                    op_name
+                );
+            }
+        }
+        has_init_kernel_from_file = true;
+        for(int i = 0 ; i < matmul_kernels_count; i++){
+            printf("kernel %d:\n", i);
+            printf("dims: %d, %d, %d, kernel->name: %s\n", matmul_kernels[i].info.M, matmul_kernels[i].info.K, matmul_kernels[i].info.N, matmul_kernels[i].name);
+        }
+    }
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */  ggml_backend_rknn_guid(),
@@ -1420,6 +1423,7 @@ void compute_submat_mul(int64_t m, // matrix A row
             }
         }
     }
+    // printf("matrix_B00_need_set_io: %d, tmp_kernel->B_is_copied: %d\n", matrix_B00_need_set_io, tmp_kernel->B_is_copied);
     // printf("thread_idx: %d\n", thread_idx);
     // printf("pad_A00: %p\n", pad_A00);
     // check_pad(A_row_00, A_col_00, pad_A00);

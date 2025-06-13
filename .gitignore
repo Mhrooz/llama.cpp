@@ -146,3 +146,12 @@ poetry.toml
 # Local scripts
 /run-vim.sh
 /run-chat.sh
+src0_shape.txt
+ggml/include/rk_mpi_mmz/readme.txt
+scripts/freq_set_status
+scripts/mat_offload.csv
+scripts/mat_kernel_test.json
+statistic_shape.py
+scripts/scaling_frequency.sh
+scripts/bench_offload.py
+scripts/get_re.py
