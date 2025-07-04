@@ -504,7 +504,15 @@ int64_t ggml_time_us(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec*1000000 + (int64_t)ts.tv_nsec/1000;
 }
+
 #endif
+
+long long ggml_gettimeofday(void){
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    long long ms = (long long)tv.tv_sec * 1000 + (long long)tv.tv_usec / 1000;
+    return ms;
+}
 
 int64_t ggml_cycles(void) {
     return clock();

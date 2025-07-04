@@ -128,6 +128,7 @@ int main(int argc, char ** argv) {
         LOG_WRN("%s: warning: scaling RoPE frequency by %g.\n", __func__, params.rope_freq_scale);
     }
 
+    printf("current timestamp: %lld us\n", ggml_gettimeofday());
     LOG_INF("%s: llama backend init\n", __func__);
 
     llama_backend_init();
@@ -667,7 +668,7 @@ int main(int argc, char ** argv) {
                 }
 
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
-
+                // printf("current timestamp in main.cpp: %lld ms \n", ggml_gettimeofday());
                 if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
                     LOG_ERR("%s : failed to eval\n", __func__);
                     return 1;
@@ -950,6 +951,7 @@ int main(int argc, char ** argv) {
         }
     }
 
+    printf("current timestamp: %lld us\n", ggml_gettimeofday());
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
         llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());

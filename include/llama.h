@@ -1390,9 +1390,12 @@ extern "C" {
         double t_load_ms;
         double t_p_eval_ms;
         double t_eval_ms;
+        double t_from_2nd_ms;
 
         int32_t n_p_eval;
         int32_t n_eval;
+
+        int64_t t_compute_start_us;
     };
 
     struct llama_perf_sampler_data {

@@ -1034,7 +1034,7 @@ struct common_init_result common_init_from_params(common_params & params) {
     if (params.warmup) {
         LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
-        llama_set_warmup(lctx, true);
+        llama_set_warmup(lctx, true); // just set bool = true
 
         std::vector<llama_token> tmp;
         llama_token bos = llama_vocab_bos(vocab);
@@ -1061,6 +1061,8 @@ struct common_init_result common_init_from_params(common_params & params) {
             tmp.push_back(decoder_start_token_id);
         }
         if (llama_model_has_decoder(model)) {
+            tmp.clear();
+            tmp.push_back(eos);
             llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
         }
         llama_kv_self_clear(lctx);
@@ -1068,7 +1070,7 @@ struct common_init_result common_init_from_params(common_params & params) {
         llama_perf_context_reset(lctx);
         llama_set_warmup(lctx, false);
     }
-
+    printf("current timestamp: %d us\n", ggml_time_us());
     iparams.model.reset(model);
     iparams.context.reset(lctx);
 
