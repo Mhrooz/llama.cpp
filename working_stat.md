@@ -4,7 +4,7 @@ This document describes the integration of the `RKNPU` backend into the `llama.c
 
 Core Process:
 
-![rknn-backend.drawio](.\rknn-backend.drawio.png)
+![rknn-backend.drawio](./rknn-backend.drawio.png)
 
 ## 2. Architecture Overview
 
