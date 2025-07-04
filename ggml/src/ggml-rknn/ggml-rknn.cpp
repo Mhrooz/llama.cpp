@@ -426,30 +426,15 @@ static void process_range(
     int start_outer, int end_outer,
     int subK, int subN, int total_j)
 {
-    const int block_size = subN * total_j * subK; // 每个outer块的大小
-
+    const int block_size = subN * total_j * subK; 
     for (int outer = start_outer; outer < end_outer; ++outer) {
-        // 计算当前outer块的目标起始位置
         float16* block_dst = dst + outer * block_size;
-
-        // 源矩阵的起始行
         const float16* outer_src = src + outer * subN * K;
-
-        // 遍历j维度（K方向分块）
         for (int j = 0; j < total_j; ++j) {
-            // 当前j块的起始位置
             const float16* j_src = outer_src + j * subK;
-
-            // 遍历subN行
             for (int i = 0; i < subN; ++i) {
-                // 目标位置：block + j块偏移 + 行内偏移
                 float16* dst_pos = block_dst + (j * subN + i) * subK;
-
-                // 源位置：当前outer块的i行，j列
                 const float16* src_pos = j_src + i * K;
-
-                // 32个float16=64字节，正好一个cacheline
-                // static_assert(sizeof(float16)*32 == 64, "Cache line size mismatch");
                 memcpy(dst_pos, src_pos, subK * sizeof(float16));
             }
         }
@@ -464,20 +449,17 @@ void transposed_matrix_to_perf_layout_multi_threads(
     const float16* src_ptr = static_cast<const float16*>(src);
     float16* dst_ptr = static_cast<float16*>(dst);
 
-    const int total_outer = N / subN;  // 外层循环次数
-    const int total_j = K / subK;      // j方向分块数
+    const int total_outer = N / subN;  
+    const int total_j = K / subK;      
 
-    // 根据物理核心数设置线程数（建议4-6）
-    const int n_threads = 1;
+    const int n_threads = 3;
     std::vector<std::thread> threads;
     threads.reserve(n_threads);
 
-    // 计算每个线程处理的outer范围
     const int min_blocks_per_thread = total_outer / n_threads;
     const int remainder = total_outer % n_threads;
 
     for (int t = 0; t < n_threads; ++t) {
-        // 带余数的均衡分配
         const int start_outer = t * min_blocks_per_thread + std::min(t, remainder);
         const int end_outer = start_outer + min_blocks_per_thread + (t < remainder ? 1 : 0);
 
@@ -686,27 +668,16 @@ static inline unsigned long long timespec_ns(const struct timespec * ts){
 }
 
 static ggml_status ggml_backend_rknn_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    // printf("rknn graph compute!!!!!!!!\n");
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
         if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
         }
-
-        // struct timespec start_compute_forward;
-        // clock_gettime(CLOCK_MONOTONIC, &start_compute_forward);
         bool ok = ggml_rk_compute_forward(backend, node);
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
-        // struct timespec end_compute_forward;
-        // clock_gettime(CLOCK_MONOTONIC, &end_compute_forward);
-
-
-        // char * pos = strstr(node->name, "ffn_out-");
-        // if(pos)
-            // printf("Node %d: %s (%s) compute time: %llu ns\n", i, node->name, ggml_op_name(node->op), timespec_ns(timespec_sub(&end_compute_forward, &start_compute_forward, &end_compute_forward)));
         GGML_ASSERT(ok);
     }
 
@@ -848,13 +819,6 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
 
     // printf("%s ", ggml_op_name(op->op));
     switch (op->op) {
-        case GGML_OP_NONE:
-        case GGML_OP_RESHAPE:
-        case GGML_OP_VIEW:
-        case GGML_OP_PERMUTE:
-        case GGML_OP_TRANSPOSE:
-            return true;
-
         case GGML_OP_MUL_MAT:
         {
             // printf("op->name: %s\n", op->name);
@@ -882,13 +846,10 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                 if(A.row == ne11 && A.col == ne10 && B.row == ne00 && B.col == ne01
                     && std::strcmp(op->name, matrix_pair.name.c_str()) == 0
                 ){
-                    // printf("op->name: %s, src0->ne1: %d\n", op->name, ne01);
                     result = true;
                     break;
                 }
             }
-            // if(result == true)
-                // printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, op->name: %s, result: %d\n", ne00, ne01, ne10, ne11, op->name, result);
             return result;
 
         }
@@ -1064,11 +1025,6 @@ ggml_backend_t ggml_backend_rknn_init(void) {
         printf("read shape pairs from json failed!\n");
         return NULL;
     }
-    // printf("ne00: %d, ne01: %d, ne10: %d, ne11: %d, ne0: %d, ne1: %d\n", (int)ne00, (int)ne01, (int)ne10, (int)ne11, (int)ne0, (int)ne1);
-
-
-
-
     return backend;
 }
 

@@ -1394,6 +1394,8 @@ extern "C" {
 
         int32_t n_p_eval;
         int32_t n_eval;
+
+        int64_t t_compute_start_us;
     };
 
     struct llama_perf_sampler_data {
