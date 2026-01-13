@@ -46,11 +46,11 @@
 using json = nlohmann::json;
 
 #define GGML_COMMON_DECL_C
-// #define RKNN_MATMUL_DEBUG
+#define RKNN_MATMUL_DEBUG
 
 #define RKNN_MATMUL_DEBUG_TIMING_INFO
 
-// #define RKNN_MATMUL_DEBUG_TIMING_DETAILS
+#define RKNN_MATMUL_DEBUG_TIMING_DETAILS
 
 #define GGML_RKNPU2_USE_OUTSIDE_ALLOC 0
 
@@ -2323,8 +2323,14 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
             // printf("ggml-rknn: supports_op: %s, %d, %d, %d, %d\n", op->name, op->op, op->ne[1], op->src[0]->ne[0], op->ne[0]);
 
             if(!rknn_config.value("npu_prefill", false) && !rknn_config.value("npu_decode", false)){
+                printf("ggml-rknn: NPU disabled - npu_prefill=%d, npu_decode=%d\n", 
+                       rknn_config.value("npu_prefill", false), 
+                       rknn_config.value("npu_decode", false));
                 return false;
             }
+
+            printf("ggml-rknn: Checking op: %s, type=%s, ne1=%d (batch size)\n", 
+                   op->name, ggml_op_name(op->op), (int)op->ne[1]);
 
             // timing_debug_printf("ggml-rknn: supports_op: %s, %s, (%d,%d,%d)\n", op->name, ggml_op_name(op->op), op->ne[1], op->src[0]->ne[0], op->ne[0]);
             // printf("%s, %s, (%d*%d*%d)\n", op->name, ggml_op_name(op->op), op->ne[1], op->src[0]->ne[0], op->ne[0]);
@@ -2358,13 +2364,20 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                 // timing_debug_printf(rknn_config["loaded_nodes"].dump().c_str());
             } 
             if (!have_loaded && rknn_config["offload_nodes"].size() > 0) {
+                printf("ggml-rknn: Checking offload patterns for node: %s\n", op->name);
                 for (const auto &node_name : rknn_config["offload_nodes"]) {
-                    std::regex pattern(node_name.get<std::string>());
+                    std::string pattern_str = node_name.get<std::string>();
+                    printf("ggml-rknn:   Testing pattern: %s\n", pattern_str.c_str());
+                    std::regex pattern(pattern_str);
                     if (std::regex_match(op->name, pattern)) {
                         to_offload = true;
+                        printf("ggml-rknn: ✓ MATCHED! Will offload node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
                         timing_debug_printf("ggml-rknn: offload node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
                         break;
                     }
+                }
+                if (!to_offload) {
+                    printf("ggml-rknn: ✗ No pattern matched for node: %s\n", op->name);
                 }
             }
 
@@ -2439,6 +2452,8 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                 }
             }
             // printf("ggml_backend_rknn_device_supports_op: %s, %d, %d, %d, %d\n", op->name, result, ne01, ne00, ne11); // n, k, m in rknn's notation
+            printf("ggml-rknn: Final decision for %s: %s (to_offload=%d, have_loaded=%d, result=%d)\n", 
+                   op->name, result ? "USE NPU" : "USE CPU", to_offload, have_loaded, result);
             return result;
 
         }
