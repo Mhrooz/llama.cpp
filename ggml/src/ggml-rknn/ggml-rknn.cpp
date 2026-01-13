@@ -2171,7 +2171,6 @@ static void ggml_rknn2_free(ggml_backend_t backend) {
 }
 
 static const char * ggml_backend_rknn_name(ggml_backend_t backend) {
-    printf("ggml-rknn: backend get_name called\n");
     return "RKNN";
 
     UNUSED(backend);
@@ -2236,7 +2235,6 @@ static size_t ggml_backend_rknn_reg_device_count(ggml_backend_reg_t reg) {
     GGML_UNUSED(reg);
 }
 static const char * ggml_backend_rknn_device_get_name(ggml_backend_dev_t dev) {
-    printf("ggml-rknn: device get_name called\n");
     return "RKNN";
     GGML_UNUSED(dev);
 }
