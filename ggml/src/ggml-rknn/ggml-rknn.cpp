@@ -2216,11 +2216,13 @@ static ggml_backend_i ggml_backend_rknn_i = {
 };
 static int ggml_backend_rknn_n_devices = 1;
 static const char * ggml_backend_rknn_reg_get_name(ggml_backend_reg_t reg) {
+    printf("ggml-rknn: Backend registry get_name called\n");
     return "RKNN";
 
     GGML_UNUSED(reg);
 }
 static size_t ggml_backend_rknn_reg_device_count(ggml_backend_reg_t reg) {
+    printf("ggml-rknn: Backend registry device_count called, returning %zu devices\n", ggml_backend_rknn_n_devices);
     return ggml_backend_rknn_n_devices;
 
     GGML_UNUSED(reg);
@@ -2557,7 +2559,11 @@ bool ggml_backend_is_rknn(ggml_backend_t backend){
 
 ggml_backend_t ggml_backend_rknn_init(void) {
     // printf("@ggml-rknn.cpp\n");
-    printf("ggml-rknn: start rknn init!\n");
+    printf("=============================================================\n");
+    printf("ggml-rknn: RKNN Backend Initialization Started\n");
+    printf("ggml-rknn: Make sure you use -ngl parameter to offload layers!\n");
+    printf("ggml-rknn: Example: llama-cli -m model.gguf -ngl 99 -p \"test\"\n");
+    printf("=============================================================\n");
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_rknn_reg(), 0);
     printf("ggml-rknn: register the rknn!\n");
     ggml_backend_rknn_context * context = (ggml_backend_rknn_context *) malloc(sizeof(ggml_backend_rknn_context));
