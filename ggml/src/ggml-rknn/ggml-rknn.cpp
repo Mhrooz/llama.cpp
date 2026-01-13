@@ -461,7 +461,7 @@ struct ggml_rknpu_matmul_part_B {
     int thread_idx;
 
     rknn_tensor_mem* B;
-    bool B_is_copied = false;
+    std::atomic<bool> B_is_copied{false};  // RKNN FIX: Use atomic to prevent race conditions
 };
 
 struct ggml_rknpu_matmul_pair {
@@ -800,7 +800,7 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
             fprintf(stderr, "ggml-rknn: DEBUG: name copied: %s\n", part_B->name);
             
             part_B->thread_idx = thread_idx;
-            part_B->B_is_copied = false;
+            part_B->B_is_copied.store(false);  // RKNN FIX: Use atomic store for consistency
 
             memset(&part_B->info, 0, sizeof(rknn_matmul_info));
             part_B ->info.M = M;
@@ -2752,7 +2752,10 @@ void compute_submat_mul( // matrix A row
                 }
             , &durations[1]);
 
-            if(!part_B->B_is_copied){
+            // RKNN FIX: Use atomic compare-exchange to ensure only one thread copies B
+            bool expected = false;
+            if(part_B->B_is_copied.compare_exchange_strong(expected, true)){
+                // This thread won the race and will copy B
                 TIMEIT(
                     B_memcpy_multithread((float16*)part_B->B->virt_addr, (float16*)mat_B.pad_data, B_pad_row_00, B_pad_col_00);
                 , &durations[2]);
@@ -2775,7 +2778,10 @@ void compute_submat_mul( // matrix A row
                 A_delta = local_A_delta;
             }
 
-            if(!part_B->B_is_copied){
+            // RKNN FIX: Use atomic compare-exchange to ensure only one thread copies B
+            bool expected = false;
+            if(part_B->B_is_copied.compare_exchange_strong(expected, true)){
+                // This thread won the race and will copy B
                 TIMEIT(
                     B_memcpy_multithread((int8_t*)part_B->B->virt_addr, (int8_t*)mat_B.pad_data, B_pad_row_00, B_pad_col_00);
                 , &durations[2]);
@@ -2796,15 +2802,13 @@ void compute_submat_mul( // matrix A row
             rknn_matmul_set_io_mem(part_AC->ctx, A_mem_for_io, &(part_AC->io_attr.A));
         , &durations[3]);
 
-        if(!(part_B->B_is_copied))
-        {
-            // if b is not copied, or if it's prefill case
+        // RKNN FIX: Use atomic compare-exchange to ensure only one thread sets B IO
+        bool expected = false;
+        if(part_B->B_is_copied.compare_exchange_strong(expected, true)){
+            // This thread won the race and will set B IO
             TIMEIT(
                 rknn_matmul_set_io_mem(part_B->ctx, part_B->B, &(part_B->io_attr.B));
             , &durations[4]);
-
-            //TODO: bad readability of B_is_copied
-            part_B->B_is_copied = true;
         }
 
         if(part_AC->prefill)
