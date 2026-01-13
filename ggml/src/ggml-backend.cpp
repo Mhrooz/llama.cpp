@@ -836,11 +836,25 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 fprintf(stderr, "  is host buffer: %s\n", ggml_backend_buffer_is_host(src->buffer) ? "YES" : "NO");
                 fprintf(stderr, "  op_offload enabled: %s\n", sched->op_offload ? "YES" : "NO");
             }
-            if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+            // RKNN FIX: Allow offloading from CPU backend regardless of buffer type
+            // Original code required ggml_backend_buffer_is_host(src->buffer), but CPU_REPACK
+            // buffers are on CPU backend but not marked as "host", preventing NPU offload
+            if (sched->op_offload && src_backend_id == sched->n_backends - 1) {
+                fprintf(stderr, "  -> Entering offload loop, checking %d backends\n", src_backend_id);
                 for (int b = 0; b < src_backend_id; b++) {
-                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                    ggml_backend_t backend = sched->backends[b];
+                    bool supports = ggml_backend_supports_op(backend, tensor);
+                    bool offloads = ggml_backend_offload_op(backend, tensor);
+                    fprintf(stderr, "    Backend %d (%s): supports_op=%s, offload_op=%s\n", 
+                            b, ggml_backend_name(backend), supports ? "YES" : "NO", offloads ? "YES" : "NO");
+                    if (supports && offloads) {
+                        fprintf(stderr, "  -> ✅ Offloading op %s to backend %d (%s)\n", 
+                                tensor->name, b, ggml_backend_name(backend));
                         SET_CAUSE(tensor, "1.off");
                         return b;
+                    }
+                }
+                fprintf(stderr, "  -> ❌ No backend accepted offload, staying on CPU\n");
                     }
                 }
             }
