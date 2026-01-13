@@ -2320,7 +2320,7 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                 return false;
             }
 
-            // printf("ggml-rknn: supports_op: %s, %d, %d, %d, %d\n", op->name, op->op, op->ne[1], op->src[0]->ne[0], op->ne[0]);
+            printf("ggml-rknn: supports_op: %s, %d, %d, %d, %d\n", op->name, op->op, op->ne[1], op->src[0]->ne[0], op->ne[0]);
 
             if(!rknn_config.value("npu_prefill", false) && !rknn_config.value("npu_decode", false)){
                 return false;
