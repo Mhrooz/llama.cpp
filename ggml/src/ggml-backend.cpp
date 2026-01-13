@@ -855,8 +855,6 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                     }
                 }
                 fprintf(stderr, "  -> ❌ No backend accepted offload, staying on CPU\n");
-                    }
-                }
             }
             SET_CAUSE(tensor, "1.wgt%d", i);
             return src_backend_id;
