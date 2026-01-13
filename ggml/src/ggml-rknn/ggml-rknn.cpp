@@ -770,81 +770,86 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
 
     timing_debug_printf("ggml-rknn: create_matmul_pair: name: %s, thread_idx: %d, num_cores: %d\n", name, thread_idx, num_cores);
 
-    ggml_rknpu_matmul_part_AC *part_AC = ggml_rknpu_matmul_part_AC_find(M, K, N, type, thread_idx);
-    ggml_rknpu_matmul_part_B *part_B = ggml_rknpu_matmul_part_B_find(name, thread_idx);
-
-    // assign to core_id = thread_idx % 3 (3 cores on RK3588)
-    rknn_core_mask core_mask = (rknn_core_mask)(1 << (thread_idx % num_cores));
-
-    timing_debug_printf("ggml-rknn: creating matmul pair for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
-
-    if (part_B == NULL) {
-        timing_debug_printf("ggml-rknn: no B found, creating new B for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
-        if (matmul_parts_B_count >= GGML_RKNPU2_MAX_MATMUL_PARTS) {
-            fprintf(stderr, "ggml-rknn: matmul_parts_B_count too much part_B \n");
-            GGML_ASSERT(0);
-        }
-
-        // Add a mutex at file/class level
-        static std::mutex matmul_parts_B_mutex;
-
-        // Then protect the increment:
-        std::lock_guard<std::mutex> lock(matmul_parts_B_mutex);
-
-        part_B = &matmul_parts_B[matmul_parts_B_count++];
-        memset(part_B, 0, sizeof(ggml_rknpu_matmul_part_B));
+    // RKNN FIX: Protect both find and create operations with the same mutex to prevent race conditions
+    static std::mutex matmul_parts_B_mutex;
+    static std::mutex matmul_parts_AC_mutex;
+    
+    ggml_rknpu_matmul_part_B *part_B = NULL;
+    {
+        std::lock_guard<std::mutex> lock_B(matmul_parts_B_mutex);
+        part_B = ggml_rknpu_matmul_part_B_find(name, thread_idx);
         
-        strncpy(part_B->name, name, GGML_NAME_MAX);
-        part_B->thread_idx = thread_idx;
-        part_B->B_is_copied = false;
+        if (part_B == NULL) {
+            // Create B node while holding the lock
+            timing_debug_printf("ggml-rknn: no B found, creating new B for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
+            if (matmul_parts_B_count >= GGML_RKNPU2_MAX_MATMUL_PARTS) {
+                fprintf(stderr, "ggml-rknn: matmul_parts_B_count too much part_B \n");
+                GGML_ASSERT(0);
+            }
 
-        // if prefill, create another io_attr in AC 
+            rknn_core_mask core_mask = (rknn_core_mask)(1 << (thread_idx % num_cores));
 
-        memset(&part_B->info, 0, sizeof(rknn_matmul_info));
-        part_B ->info.M = M;
-        part_B ->info.K = K;
-        part_B ->info.N = N;
-        part_B ->info.type = type;
-        part_B ->info.B_layout = 1; // B use native layout (weight)
-        part_B ->info.AC_layout = 0; // A and C use normal layout (RKNN_MM_LAYOUT_NORM) for faster prefill
+            fprintf(stderr, "ggml-rknn: DEBUG: allocating part_B at index %d\n", matmul_parts_B_count);
+            part_B = &matmul_parts_B[matmul_parts_B_count++];
+            fprintf(stderr, "ggml-rknn: DEBUG: part_B allocated at %p\n", (void*)part_B);
+            
+            memset(part_B, 0, sizeof(ggml_rknpu_matmul_part_B));
+            fprintf(stderr, "ggml-rknn: DEBUG: memset complete\n");
+            
+            strncpy(part_B->name, name, GGML_NAME_MAX);
+            fprintf(stderr, "ggml-rknn: DEBUG: name copied: %s\n", part_B->name);
+            
+            part_B->thread_idx = thread_idx;
+            part_B->B_is_copied = false;
 
-        memset(&part_B->io_attr, 0, sizeof(rknn_matmul_io_attr));
+            memset(&part_B->info, 0, sizeof(rknn_matmul_info));
+            part_B ->info.M = M;
+            part_B ->info.K = K;
+            part_B ->info.N = N;
+            part_B ->info.type = type;
+            part_B ->info.B_layout = 1;
+            part_B ->info.AC_layout = 0;
 
-        int ret = rknn_matmul_create(&(part_B->ctx), &(part_B->info), &(part_B->io_attr));
-        GGML_ASSERT(ret == 0);
+            memset(&part_B->io_attr, 0, sizeof(rknn_matmul_io_attr));
+            fprintf(stderr, "ggml-rknn: DEBUG: calling rknn_matmul_create\n");
 
-        rknn_matmul_set_core_mask(part_B->ctx, core_mask);
+            int ret = rknn_matmul_create(&(part_B->ctx), &(part_B->info), &(part_B->io_attr));
+            fprintf(stderr, "ggml-rknn: DEBUG: rknn_matmul_create returned %d, ctx=%p\n", ret, (void*)part_B->ctx);
+            GGML_ASSERT(ret == 0);
 
-        #if GGML_RKNPU2_USE_OUTSIDE_ALLOC
-            int fd = -1;
-            uint8_t *va = NULL;
-            dma_alloc(part_B->io_attr.B.size, &fd, (void **)&va);
-            dma_sync_device_to_cpu(fd);
-            part_B->B = rknn_create_mem_from_fd(part_B->ctx, fd, va,
-                                            part_B->io_attr.B.size, 0);
+            rknn_matmul_set_core_mask(part_B->ctx, core_mask);
+            fprintf(stderr, "ggml-rknn: DEBUG: core mask set\n");
 
-        #else
-            part_B->B =
-                rknn_create_mem(part_B->ctx, part_B->io_attr.B.size);
-        #endif
-        
-        // // Protect rknpu2_allocated_bytes with mutex
-        // static std::mutex rknpu2_allocated_bytes_mutex;
-        // {
-        //     std::lock_guard<std::mutex> alloc_lock_b(rknpu2_allocated_bytes_mutex);
-        //     rknpu2_allocated_bytes += part_B->io_attr.B.size;
-        // }
-        if (part_B->B == NULL) {
-            fprintf(stderr, "ggml-rknn: rknn_create_mem failed for B node %s:%d size %u\n", name, thread_idx, part_B->io_attr.B.size);
-            fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", rknpu2_allocated_bytes, MAX_RKNN_MEMORY);
-            GGML_ASSERT(0);
+            #if GGML_RKNPU2_USE_OUTSIDE_ALLOC
+                int fd = -1;
+                uint8_t *va = NULL;
+                dma_alloc(part_B->io_attr.B.size, &fd, (void **)&va);
+                dma_sync_device_to_cpu(fd);
+                part_B->B = rknn_create_mem_from_fd(part_B->ctx, fd, va,
+                                                part_B->io_attr.B.size, 0);
+            #else
+                fprintf(stderr, "ggml-rknn: DEBUG: creating mem with size %u\n", part_B->io_attr.B.size);
+                part_B->B = rknn_create_mem(part_B->ctx, part_B->io_attr.B.size);
+                fprintf(stderr, "ggml-rknn: DEBUG: rknn_create_mem returned %p\n", (void*)part_B->B);
+            #endif
+            
+            if (part_B->B == NULL) {
+                fprintf(stderr, "ggml-rknn: rknn_create_mem failed for B node %s:%d size %u\n", name, thread_idx, part_B->io_attr.B.size);
+                fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", rknpu2_allocated_bytes, MAX_RKNN_MEMORY);
+                GGML_ASSERT(0);
+            }
+
+            timing_debug_printf("ggml-rknn: created B node %s:%d; bytes: %ud\n", name, thread_idx, part_B->io_attr.B.size);
+        } else {
+            timing_debug_printf("ggml-rknn: found B node %s:%d size %d x %d x %d\n", part_B->name, part_B->thread_idx, part_B->info.M, part_B->info.K, part_B->info.N);
         }
-
-        timing_debug_printf("ggml-rknn: created B node %s:%d; bytes: %ud\n", name, thread_idx, part_B->io_attr.B.size);
-    } else {
-        timing_debug_printf("ggml-rknn: found B node %s:%d size %d x %d x %d\n", part_B->name, part_B->thread_idx, part_B->info.M, part_B->info.K, part_B->info.N);
     }
     GGML_ASSERT(part_B != NULL);
+
+    ggml_rknpu_matmul_part_AC *part_AC = NULL;
+    {
+        std::lock_guard<std::mutex> lock_AC(matmul_parts_AC_mutex);
+        part_AC = ggml_rknpu_matmul_part_AC_find(M, K, N, type, thread_idx);
 
     if (part_AC == NULL) {
         timing_debug_printf("ggml-rknn: no AC found, creating new AC for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
@@ -852,11 +857,8 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
             fprintf(stderr, "ggml-rknn: matmul_parts_AC_count too much part_AC \n");
             GGML_ASSERT(0);
         }
-        // Add a mutex at file/class level
-        static std::mutex matmul_parts_AC_mutex;
 
-        // Then protect the increment:
-        std::lock_guard<std::mutex> lock(matmul_parts_AC_mutex);
+        rknn_core_mask core_mask = (rknn_core_mask)(1 << (thread_idx % num_cores));
 
         part_AC = &matmul_parts_AC[matmul_parts_AC_count++];
         memset(part_AC, 0, sizeof(ggml_rknpu_matmul_part_AC));
@@ -954,6 +956,7 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
             GGML_ASSERT(0);
         }
     }
+    } // End of matmul_parts_AC_mutex lock scope
     GGML_ASSERT(part_AC != NULL);
 
     timing_debug_printf("ggml-rknn: created matmul pair for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
