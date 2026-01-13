@@ -86,7 +86,7 @@ static void sigint_handler(int signo) {
 int main(int argc, char ** argv) {
     common_params params;
     g_params = &params;
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) {
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI, print_usage)) {
         return 1;
     }
 
@@ -137,10 +137,10 @@ int main(int argc, char ** argv) {
 
     // load the model and apply lora adapter, if any
     LOG_INF("%s: load the model and apply lora adapter, if any\n", __func__);
-    common_init_result llama_init = common_init_from_params(params);
+    common_init_result_ptr llama_init = common_init_from_params(params);
 
-    model = llama_init.model.get();
-    ctx = llama_init.context.get();
+    model = llama_init->model();
+    ctx = llama_init->context();
 
     if (model == NULL) {
         LOG_ERR("%s: error: unable to load model\n", __func__);
