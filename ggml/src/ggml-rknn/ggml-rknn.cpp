@@ -2102,9 +2102,16 @@ static inline unsigned long long timespec_ns(const struct timespec * ts){
 }
 
 static ggml_status ggml_backend_rknn_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    printf("=============================================================\n");
+    printf("ggml-rknn: ⚠️ GRAPH COMPUTE CALLED! Nodes: %d\n", cgraph->n_nodes);
+    printf("=============================================================\n");
     GGML_LOG("rknn graph compute!!!!!!!!, cgraph->n_nodes: %d\n", cgraph->n_nodes);
     
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        printf("ggml-rknn: Processing node %d/%d: %s (%s)\n", 
+               i+1, cgraph->n_nodes, 
+               cgraph->nodes[i]->name, 
+               ggml_op_name(cgraph->nodes[i]->op));
         timing_debug_printf("rknn graph compute node: %d, node->name: %s\n", i, cgraph->nodes[i]->name);
         ggml_tensor * node = cgraph->nodes[i];
 
@@ -2322,17 +2329,17 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                 return false;
             }
 
-            // printf("ggml-rknn: supports_op: %s, %d, %d, %d, %d\n", op->name, op->op, op->ne[1], op->src[0]->ne[0], op->ne[0]);
+            printf("ggml-rknn: supports_op called for: %s\n", op->name);
 
             if(!rknn_config.value("npu_prefill", false) && !rknn_config.value("npu_decode", false)){
-                // printf("ggml-rknn: NPU disabled - npu_prefill=%d, npu_decode=%d\n", 
-                    //    rknn_config.value("npu_prefill", false), 
-                    //    rknn_config.value("npu_decode", false));
+                printf("ggml-rknn: ✗ NPU disabled - npu_prefill=%d, npu_decode=%d\n", 
+                       rknn_config.value("npu_prefill", false), 
+                       rknn_config.value("npu_decode", false));
                 return false;
             }
 
-            // printf("ggml-rknn: Checking op: %s, type=%s, ne1=%d (batch size)\n", 
-                //    op->name, ggml_op_name(op->op), (int)op->ne[1]);
+            printf("ggml-rknn: NPU enabled - checking op: %s, type=%s, ne1=%ld (batch size)\n", 
+                   op->name, ggml_op_name(op->op), op->ne[1]);
 
             // timing_debug_printf("ggml-rknn: supports_op: %s, %s, (%d,%d,%d)\n", op->name, ggml_op_name(op->op), op->ne[1], op->src[0]->ne[0], op->ne[0]);
             // printf("%s, %s, (%d*%d*%d)\n", op->name, ggml_op_name(op->op), op->ne[1], op->src[0]->ne[0], op->ne[0]);
@@ -2362,24 +2369,22 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
             // Use hashset for O(1) lookup instead of O(n) linear search
             if (loaded_nodes_set.find(std::string(op->name)) != loaded_nodes_set.end()) {
                 have_loaded = true;
-                // timing_debug_printf("ggml-rknn: loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
-                // timing_debug_printf(rknn_config["loaded_nodes"].dump().c_str());
+                printf("ggml-rknn:   Already loaded node: %s\n", op->name);
             } 
             if (!have_loaded && rknn_config["offload_nodes"].size() > 0) {
-                // printf("ggml-rknn: Checking offload patterns for node: %s\n", op->name);
+                printf("ggml-rknn:   Checking offload patterns for: %s\n", op->name);
                 for (const auto &node_name : rknn_config["offload_nodes"]) {
                     std::string pattern_str = node_name.get<std::string>();
-                    // printf("ggml-rknn:   Testing pattern: %s\n", pattern_str.c_str());
+                    printf("ggml-rknn:     Testing pattern: '%s'\n", pattern_str.c_str());
                     std::regex pattern(pattern_str);
                     if (std::regex_match(op->name, pattern)) {
                         to_offload = true;
-                        // printf("ggml-rknn: ✓ MATCHED! Will offload node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
-                        // timing_debug_printf("ggml-rknn: offload node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
+                        printf("ggml-rknn:     ✓ MATCHED! Will offload: %s (M=%ld, K=%ld, N=%ld)\n", op->name, ne1, ne00, ne0);
                         break;
                     }
                 }
                 if (!to_offload) {
-                    // printf("ggml-rknn: ✗ No pattern matched for node: %s\n", op->name);
+                    printf("ggml-rknn:     ✗ No pattern matched for: %s\n", op->name);
                 }
             }
 
@@ -2453,9 +2458,8 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                     }
                 }
             }
-            // printf("ggml_backend_rknn_device_supports_op: %s, %d, %d, %d, %d\n", op->name, result, ne01, ne00, ne11); // n, k, m in rknn's notation
-            // printf("ggml-rknn: Final decision for %s: %s (to_offload=%d, have_loaded=%d, result=%d)\n", 
-                //    op->name, result ? "USE NPU" : "USE CPU", to_offload, have_loaded, result);
+            printf("ggml-rknn: *** FINAL DECISION for %s: %s (to_offload=%d, have_loaded=%d) ***\n", 
+                   op->name, result ? "✓ USE NPU" : "✗ USE CPU", to_offload, have_loaded);
             return result;
 
         }
@@ -2468,10 +2472,34 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
     GGML_UNUSED(dev);
 }
 static bool ggml_backend_rknn_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft);
+    // RKNN backend can work with host (CPU) buffers
+    // This is crucial for the scheduler to assign operations to RKNN backend
+    printf("ggml-rknn: supports_buft called, is_host=%d\n", ggml_backend_buft_is_host(buft));
+    
+    // Accept both CPU/host buffers (for model weights) and RKNN buffers
+    if (ggml_backend_buft_is_host(buft)) {
+        return true;
+    }
+    
+    // Also accept RKNN's own buffer type
+    if (buft->device == dev) {
+        return true;
+    }
+    
+    return false;
 
     GGML_UNUSED(dev);
 }
+
+static bool ggml_backend_rknn_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // This function is called by the scheduler to decide if an operation should be offloaded
+    // We delegate to supports_op for the actual decision
+    printf("ggml-rknn: offload_op called for: %s\n", op->name);
+    bool should_offload = ggml_backend_rknn_device_supports_op(dev, op);
+    printf("ggml-rknn: offload_op decision for %s: %s\n", op->name, should_offload ? "YES" : "NO");
+    return should_offload;
+}
+
 static const struct ggml_backend_device_i ggml_backend_rknn_device_i = {
     /* .get_name             = */ ggml_backend_rknn_device_get_name,
     /* .get_description      = */ ggml_backend_rknn_device_get_description,
@@ -2484,7 +2512,7 @@ static const struct ggml_backend_device_i ggml_backend_rknn_device_i = {
     /* .buffer_from_host_ptr = */ ggml_backend_rknn_device_buffer_from_host_ptr,
     /* .supports_op          = */ ggml_backend_rknn_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rknn_device_supports_buft,
-    /* .offload_op           = */ NULL,
+    /* .offload_op           = */ ggml_backend_rknn_device_offload_op,
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
