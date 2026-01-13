@@ -2195,7 +2195,7 @@ void ggml_backend_rknn_set_n_threads(ggml_backend_t backend_rknn, int n_threads)
     // if (n_threads > 3) { ctx->n_threads = 3;} 
     
     // TODO: hardcode 6 threads
-    ctx->rknn_threads = 3;
+    ctx->rknn_threads = 1;
     ctx->ggml_threads = n_threads;
 
     // ctx->rknn_config = &local_rknn_config;
