@@ -2472,12 +2472,18 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
     GGML_UNUSED(dev);
 }
 static bool ggml_backend_rknn_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    // RKNN backend can work with host (CPU) buffers
+    // RKNN backend can work with CPU buffers (including CPU_REPACK)
     // This is crucial for the scheduler to assign operations to RKNN backend
-    printf("ggml-rknn: supports_buft called, is_host=%d\n", ggml_backend_buft_is_host(buft));
     
-    // Accept both CPU/host buffers (for model weights) and RKNN buffers
+    // Accept host buffers
     if (ggml_backend_buft_is_host(buft)) {
+        return true;
+    }
+    
+    // Accept CPU backend buffers (including CPU_REPACK which is not marked as "host")
+    // Check if the buffer type name contains "CPU"
+    const char * buft_name = ggml_backend_buft_name(buft);
+    if (buft_name && strstr(buft_name, "CPU") != NULL) {
         return true;
     }
     
@@ -2500,6 +2506,16 @@ static bool ggml_backend_rknn_device_offload_op(ggml_backend_dev_t dev, const gg
     return should_offload;
 }
 
+// Forward declare CPU buffer type getter
+extern "C" ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
+
+static ggml_backend_buffer_type_t ggml_backend_rknn_device_get_host_buffer_type(ggml_backend_dev_t dev) {
+    // RKNN can read from CPU host memory
+    // This tells the scheduler that RKNN can work with CPU buffers (including CPU_REPACK)
+    GGML_UNUSED(dev);
+    return ggml_backend_cpu_buffer_type();
+}
+
 static const struct ggml_backend_device_i ggml_backend_rknn_device_i = {
     /* .get_name             = */ ggml_backend_rknn_device_get_name,
     /* .get_description      = */ ggml_backend_rknn_device_get_description,
@@ -2508,7 +2524,7 @@ static const struct ggml_backend_device_i ggml_backend_rknn_device_i = {
     /* .get_props            = */ ggml_backend_rknn_device_get_props,
     /* .init_backend         = */ ggml_backend_rknn_device_init_backend,
     /* .get_buffer_type      = */ ggml_backend_rknn_device_get_buffer_type,
-    /* .get_host_buffer_type = */ NULL,
+    /* .get_host_buffer_type = */ ggml_backend_rknn_device_get_host_buffer_type,
     /* .buffer_from_host_ptr = */ ggml_backend_rknn_device_buffer_from_host_ptr,
     /* .supports_op          = */ ggml_backend_rknn_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rknn_device_supports_buft,
