@@ -46,11 +46,11 @@
 using json = nlohmann::json;
 
 #define GGML_COMMON_DECL_C
-#define RKNN_MATMUL_DEBUG
+// #define RKNN_MATMUL_DEBUG
 
-#define RKNN_MATMUL_DEBUG_TIMING_INFO
+// #define RKNN_MATMUL_DEBUG_TIMING_INFO
 
-#define RKNN_MATMUL_DEBUG_TIMING_DETAILS
+// #define RKNN_MATMUL_DEBUG_TIMING_DETAILS
 
 #define GGML_RKNPU2_USE_OUTSIDE_ALLOC 0
 
@@ -461,7 +461,7 @@ struct ggml_rknpu_matmul_part_B {
     int thread_idx;
 
     rknn_tensor_mem* B;
-    std::atomic<bool> B_is_copied{false};  // RKNN FIX: Use atomic to prevent race conditions
+    bool B_is_copied = false;
 };
 
 struct ggml_rknpu_matmul_pair {
@@ -606,81 +606,6 @@ static ggml_rknpu_matmul_part_B matmul_parts_B[GGML_RKNPU2_MAX_MATMUL_PARTS];
 static int matmul_parts_AC_count = 0;
 static int matmul_parts_B_count = 0;
 
-// Cache for shared A NPU memory (key: M, K, type)
-// This avoids repeated allocation/deallocation of shared A memory during prefill
-struct SharedAMemCache {
-    std::mutex mutex;
-    // Map from (M, K, type) to (npu_mem, ctx, size)
-    std::map<std::tuple<int, int, int>, std::tuple<rknn_tensor_mem*, rknn_matmul_ctx, uint32_t>> cache;
-    
-    rknn_tensor_mem* get_or_create(int M, int K, rknn_matmul_type type, 
-                                    rknn_matmul_ctx ctx, uint32_t required_size) {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto key = std::make_tuple(M, K, (int)type);
-        auto it = cache.find(key);
-        if (it != cache.end()) {
-            // Check if cached size is sufficient
-            uint32_t cached_size = std::get<2>(it->second);
-            if (cached_size >= required_size) {
-                return std::get<0>(it->second);
-            }
-            // Size mismatch, destroy old and create new
-            rknn_destroy_mem(std::get<1>(it->second), std::get<0>(it->second));
-            cache.erase(it);
-        }
-        // Create new
-        rknn_tensor_mem* mem = rknn_create_mem(ctx, required_size);
-        if (mem != NULL) {
-            cache[key] = std::make_tuple(mem, ctx, required_size);
-        }
-        return mem;
-    }
-    
-    ~SharedAMemCache() {
-        for (auto& kv : cache) {
-            rknn_destroy_mem(std::get<1>(kv.second), std::get<0>(kv.second));
-        }
-    }
-};
-static SharedAMemCache shared_A_mem_cache;
-
-// Cache for C NPU memory (key: M, N, thread_idx, type)
-// This avoids repeated allocation/deallocation of C memory during prefill
-struct SharedCMemCache {
-    std::mutex mutex;
-    // Map from (M, N, thread_idx, type) to (npu_mem, ctx, size)
-    std::map<std::tuple<int, int, int, int>, std::tuple<rknn_tensor_mem*, rknn_matmul_ctx, uint32_t>> cache;
-    
-    rknn_tensor_mem* get_or_create(int M, int N, int thread_idx, rknn_matmul_type type, 
-                                    rknn_matmul_ctx ctx, uint32_t required_size) {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto key = std::make_tuple(M, N, thread_idx, (int)type);
-        auto it = cache.find(key);
-        if (it != cache.end()) {
-            uint32_t cached_size = std::get<2>(it->second);
-            if (cached_size >= required_size) {
-                return std::get<0>(it->second);
-            }
-            // Size mismatch, destroy old and create new
-            rknn_destroy_mem(std::get<1>(it->second), std::get<0>(it->second));
-            cache.erase(it);
-        }
-        // Create new
-        rknn_tensor_mem* mem = rknn_create_mem(ctx, required_size);
-        if (mem != NULL) {
-            cache[key] = std::make_tuple(mem, ctx, required_size);
-        }
-        return mem;
-    }
-    
-    ~SharedCMemCache() {
-        for (auto& kv : cache) {
-            rknn_destroy_mem(std::get<1>(kv.second), std::get<0>(kv.second));
-        }
-    }
-};
-static SharedCMemCache shared_C_mem_cache;
-
 const char* rknpu2_matmul_type_to_string(rknn_matmul_type type)
 {
     switch(type) {
@@ -770,86 +695,81 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
 
     timing_debug_printf("ggml-rknn: create_matmul_pair: name: %s, thread_idx: %d, num_cores: %d\n", name, thread_idx, num_cores);
 
-    // RKNN FIX: Protect both find and create operations with the same mutex to prevent race conditions
-    static std::mutex matmul_parts_B_mutex;
-    static std::mutex matmul_parts_AC_mutex;
-    
-    ggml_rknpu_matmul_part_B *part_B = NULL;
-    {
-        std::lock_guard<std::mutex> lock_B(matmul_parts_B_mutex);
-        part_B = ggml_rknpu_matmul_part_B_find(name, thread_idx);
-        
-        if (part_B == NULL) {
-            // Create B node while holding the lock
-            timing_debug_printf("ggml-rknn: no B found, creating new B for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
-            if (matmul_parts_B_count >= GGML_RKNPU2_MAX_MATMUL_PARTS) {
-                fprintf(stderr, "ggml-rknn: matmul_parts_B_count too much part_B \n");
-                GGML_ASSERT(0);
-            }
+    ggml_rknpu_matmul_part_AC *part_AC = ggml_rknpu_matmul_part_AC_find(M, K, N, type, thread_idx);
+    ggml_rknpu_matmul_part_B *part_B = ggml_rknpu_matmul_part_B_find(name, thread_idx);
 
-            rknn_core_mask core_mask = (rknn_core_mask)(1 << (thread_idx % num_cores));
+    // assign to core_id = thread_idx % 3 (3 cores on RK3588)
+    rknn_core_mask core_mask = (rknn_core_mask)(1 << (thread_idx % num_cores));
 
-            fprintf(stderr, "ggml-rknn: DEBUG: allocating part_B at index %d\n", matmul_parts_B_count);
-            part_B = &matmul_parts_B[matmul_parts_B_count++];
-            fprintf(stderr, "ggml-rknn: DEBUG: part_B allocated at %p\n", (void*)part_B);
-            
-            memset(part_B, 0, sizeof(ggml_rknpu_matmul_part_B));
-            fprintf(stderr, "ggml-rknn: DEBUG: memset complete\n");
-            
-            strncpy(part_B->name, name, GGML_NAME_MAX);
-            fprintf(stderr, "ggml-rknn: DEBUG: name copied: %s\n", part_B->name);
-            
-            part_B->thread_idx = thread_idx;
-            part_B->B_is_copied.store(false);  // RKNN FIX: Use atomic store for consistency
+    timing_debug_printf("ggml-rknn: creating matmul pair for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
 
-            memset(&part_B->info, 0, sizeof(rknn_matmul_info));
-            part_B ->info.M = M;
-            part_B ->info.K = K;
-            part_B ->info.N = N;
-            part_B ->info.type = type;
-            part_B ->info.B_layout = 1;
-            part_B ->info.AC_layout = 0;
-
-            memset(&part_B->io_attr, 0, sizeof(rknn_matmul_io_attr));
-            fprintf(stderr, "ggml-rknn: DEBUG: calling rknn_matmul_create\n");
-
-            int ret = rknn_matmul_create(&(part_B->ctx), &(part_B->info), &(part_B->io_attr));
-            fprintf(stderr, "ggml-rknn: DEBUG: rknn_matmul_create returned %d, ctx=%p\n", ret, (void*)part_B->ctx);
-            GGML_ASSERT(ret == 0);
-
-            rknn_matmul_set_core_mask(part_B->ctx, core_mask);
-            fprintf(stderr, "ggml-rknn: DEBUG: core mask set\n");
-
-            #if GGML_RKNPU2_USE_OUTSIDE_ALLOC
-                int fd = -1;
-                uint8_t *va = NULL;
-                dma_alloc(part_B->io_attr.B.size, &fd, (void **)&va);
-                dma_sync_device_to_cpu(fd);
-                part_B->B = rknn_create_mem_from_fd(part_B->ctx, fd, va,
-                                                part_B->io_attr.B.size, 0);
-            #else
-                fprintf(stderr, "ggml-rknn: DEBUG: creating mem with size %u\n", part_B->io_attr.B.size);
-                part_B->B = rknn_create_mem(part_B->ctx, part_B->io_attr.B.size);
-                fprintf(stderr, "ggml-rknn: DEBUG: rknn_create_mem returned %p\n", (void*)part_B->B);
-            #endif
-            
-            if (part_B->B == NULL) {
-                fprintf(stderr, "ggml-rknn: rknn_create_mem failed for B node %s:%d size %u\n", name, thread_idx, part_B->io_attr.B.size);
-                fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", rknpu2_allocated_bytes, MAX_RKNN_MEMORY);
-                GGML_ASSERT(0);
-            }
-
-            timing_debug_printf("ggml-rknn: created B node %s:%d; bytes: %ud\n", name, thread_idx, part_B->io_attr.B.size);
-        } else {
-            timing_debug_printf("ggml-rknn: found B node %s:%d size %d x %d x %d\n", part_B->name, part_B->thread_idx, part_B->info.M, part_B->info.K, part_B->info.N);
+    if (part_B == NULL) {
+        timing_debug_printf("ggml-rknn: no B found, creating new B for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
+        if (matmul_parts_B_count >= GGML_RKNPU2_MAX_MATMUL_PARTS) {
+            fprintf(stderr, "ggml-rknn: matmul_parts_B_count too much part_B \n");
+            GGML_ASSERT(0);
         }
+
+        // Add a mutex at file/class level
+        static std::mutex matmul_parts_B_mutex;
+
+        // Then protect the increment:
+        std::lock_guard<std::mutex> lock(matmul_parts_B_mutex);
+
+        part_B = &matmul_parts_B[matmul_parts_B_count++];
+        memset(part_B, 0, sizeof(ggml_rknpu_matmul_part_B));
+        
+        strncpy(part_B->name, name, GGML_NAME_MAX);
+        part_B->thread_idx = thread_idx;
+        part_B->B_is_copied = false;
+
+        // if prefill, create another io_attr in AC 
+
+        memset(&part_B->info, 0, sizeof(rknn_matmul_info));
+        part_B ->info.M = M;
+        part_B ->info.K = K;
+        part_B ->info.N = N;
+        part_B ->info.type = type;
+        part_B ->info.B_layout = 1; // B use native layout (weight)
+        part_B ->info.AC_layout = 0; // A and C use normal layout (RKNN_MM_LAYOUT_NORM) for faster prefill
+
+        memset(&part_B->io_attr, 0, sizeof(rknn_matmul_io_attr));
+
+        int ret = rknn_matmul_create(&(part_B->ctx), &(part_B->info), &(part_B->io_attr));
+        GGML_ASSERT(ret == 0);
+
+        rknn_matmul_set_core_mask(part_B->ctx, core_mask);
+
+        #if GGML_RKNPU2_USE_OUTSIDE_ALLOC
+            int fd = -1;
+            uint8_t *va = NULL;
+            dma_alloc(part_B->io_attr.B.size, &fd, (void **)&va);
+            dma_sync_device_to_cpu(fd);
+            part_B->B = rknn_create_mem_from_fd(part_B->ctx, fd, va,
+                                            part_B->io_attr.B.size, 0);
+
+        #else
+            part_B->B =
+                rknn_create_mem(part_B->ctx, part_B->io_attr.B.size);
+        #endif
+        
+        // // Protect rknpu2_allocated_bytes with mutex
+        // static std::mutex rknpu2_allocated_bytes_mutex;
+        // {
+        //     std::lock_guard<std::mutex> alloc_lock_b(rknpu2_allocated_bytes_mutex);
+        //     rknpu2_allocated_bytes += part_B->io_attr.B.size;
+        // }
+        if (part_B->B == NULL) {
+            fprintf(stderr, "ggml-rknn: rknn_create_mem failed for B node %s:%d size %u\n", name, thread_idx, part_B->io_attr.B.size);
+            fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", rknpu2_allocated_bytes, MAX_RKNN_MEMORY);
+            GGML_ASSERT(0);
+        }
+
+        timing_debug_printf("ggml-rknn: created B node %s:%d; bytes: %ud\n", name, thread_idx, part_B->io_attr.B.size);
+    } else {
+        timing_debug_printf("ggml-rknn: found B node %s:%d size %d x %d x %d\n", part_B->name, part_B->thread_idx, part_B->info.M, part_B->info.K, part_B->info.N);
     }
     GGML_ASSERT(part_B != NULL);
-
-    ggml_rknpu_matmul_part_AC *part_AC = NULL;
-    {
-        std::lock_guard<std::mutex> lock_AC(matmul_parts_AC_mutex);
-        part_AC = ggml_rknpu_matmul_part_AC_find(M, K, N, type, thread_idx);
 
     if (part_AC == NULL) {
         timing_debug_printf("ggml-rknn: no AC found, creating new AC for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
@@ -857,8 +777,11 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
             fprintf(stderr, "ggml-rknn: matmul_parts_AC_count too much part_AC \n");
             GGML_ASSERT(0);
         }
+        // Add a mutex at file/class level
+        static std::mutex matmul_parts_AC_mutex;
 
-        rknn_core_mask core_mask = (rknn_core_mask)(1 << (thread_idx % num_cores));
+        // Then protect the increment:
+        std::lock_guard<std::mutex> lock(matmul_parts_AC_mutex);
 
         part_AC = &matmul_parts_AC[matmul_parts_AC_count++];
         memset(part_AC, 0, sizeof(ggml_rknpu_matmul_part_AC));
@@ -892,7 +815,7 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
                 GGML_ASSERT(0);
             }
 
-            rknn_matmul_set_core_mask(part_AC->ctx, core_mask);
+            rknn_set_core_mask(part_AC->ctx, core_mask);
 
             // assume we have warmup before prefill
 
@@ -956,7 +879,6 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
             GGML_ASSERT(0);
         }
     }
-    } // End of matmul_parts_AC_mutex lock scope
     GGML_ASSERT(part_AC != NULL);
 
     timing_debug_printf("ggml-rknn: created matmul pair for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
@@ -1210,21 +1132,9 @@ void convert_ggml_to_rknn_norm_layout_A_f16(const float * src, rknpu2::float16 *
     #pragma omp parallel for num_threads(omp_threads) schedule(static)
     for (int m = 0; m < M; m++) {
         const float* src_row = src + m * K;  // GGML: row m starts at offset m*K (assuming row-major F32 input)
-        uint16_t* dst_row = (uint16_t*)(dst + m * K);  // RKNN: row m starts at offset m*K
-        
-        int k = 0;
-#ifdef __ARM_NEON
-        // Process 8 elements at a time using NEON SIMD
-        for (; k + 7 < K; k += 8) {
-            float32x4_t f32_vec_0 = vld1q_f32(src_row + k);
-            float32x4_t f32_vec_1 = vld1q_f32(src_row + k + 4);
-            float16x8_t f16_vec = vcombine_f16(vcvt_f16_f32(f32_vec_0), vcvt_f16_f32(f32_vec_1));
-            vst1q_u16(dst_row + k, vreinterpretq_u16_f16(f16_vec));
-        }
-#endif
-        // Handle remaining elements
-        for (; k < K; k++) {
-            dst_row[k] = GGML_FP32_TO_FP16(src_row[k]);
+        rknpu2::float16* dst_row = dst + m * K;  // RKNN: row m starts at offset m*K
+        for (int k = 0; k < K; k++) {
+            dst_row[k] = (rknpu2::float16)src_row[k];
         }
     }
 }
@@ -1241,19 +1151,7 @@ void convert_ggml_to_rknn_norm_layout_A_q8(const float * src, int8_t * dst, floa
         
         // Find max abs value in row for quantization scale
         float amax = 0.0f;
-        int k = 0;
-#ifdef __ARM_NEON
-        float32x4_t amax_vec = vdupq_n_f32(0.0f);
-        for (; k + 3 < K; k += 4) {
-            float32x4_t v = vld1q_f32(src_row + k);
-            amax_vec = vmaxq_f32(amax_vec, vabsq_f32(v));
-        }
-        // Reduce vector to scalar
-        float32x2_t amax2 = vpmax_f32(vget_low_f32(amax_vec), vget_high_f32(amax_vec));
-        amax2 = vpmax_f32(amax2, amax2);
-        amax = vget_lane_f32(amax2, 0);
-#endif
-        for (; k < K; k++) {
+        for (int k = 0; k < K; k++) {
             amax = std::max(amax, std::abs(src_row[k]));
         }
         
@@ -1261,21 +1159,7 @@ void convert_ggml_to_rknn_norm_layout_A_q8(const float * src, int8_t * dst, floa
         const float inv_scale = (delta[m] > 0) ? (1.0f / delta[m]) : 0.0f;
         
         // Quantize the row
-        k = 0;
-#ifdef __ARM_NEON
-        const float32x4_t inv_scale_vec = vdupq_n_f32(inv_scale);
-        for (; k + 3 < K; k += 4) {
-            float32x4_t v = vld1q_f32(src_row + k);
-            v = vmulq_f32(v, inv_scale_vec);
-            // Round to nearest: add 0.5 for positive, -0.5 for negative, then truncate
-            int32x4_t i32 = vcvtnq_s32_f32(v);  // Round to nearest even
-            int16x4_t i16 = vqmovn_s32(i32);    // Saturate to int16
-            int8x8_t i8 = vqmovn_s16(vcombine_s16(i16, i16)); // Saturate to int8
-            // Store only lower 4 bytes
-            vst1_lane_s32((int32_t*)(dst_row + k), vreinterpret_s32_s8(i8), 0);
-        }
-#endif
-        for (; k < K; k++) {
+        for (int k = 0; k < K; k++) {
             dst_row[k] = (int8_t)roundf(src_row[k] * inv_scale);
         }
     }
@@ -1308,19 +1192,7 @@ void copy_rknn_norm_layout_C_to_ggml_q8(const int32_t * src, float * dst, const 
         float* dst_row = dst + m * ori_N + col_start;
         const float scale_a = delta_a[m];
         
-        int n = 0;
-#ifdef __ARM_NEON
-        const float32x4_t scale_a_vec = vdupq_n_f32(scale_a);
-        for (; n + 3 < N; n += 4) {
-            int32x4_t i32_vec = vld1q_s32(src_row + n);
-            float32x4_t scale_b_vec = vld1q_f32(delta_b + n);
-            float32x4_t f32_vec = vcvtq_f32_s32(i32_vec);
-            f32_vec = vmulq_f32(f32_vec, scale_a_vec);
-            f32_vec = vmulq_f32(f32_vec, scale_b_vec);
-            vst1q_f32(dst_row + n, f32_vec);
-        }
-#endif
-        for (; n < N; n++) {
+        for (int n = 0; n < N; n++) {
             dst_row[n] = (float)src_row[n] * scale_a * delta_b[n];
         }
     }
@@ -2105,22 +1977,13 @@ static inline unsigned long long timespec_ns(const struct timespec * ts){
 }
 
 static ggml_status ggml_backend_rknn_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    printf("=============================================================\n");
-    printf("ggml-rknn: ⚠️ GRAPH COMPUTE CALLED! Nodes: %d\n", cgraph->n_nodes);
-    printf("=============================================================\n");
-    GGML_LOG("rknn graph compute!!!!!!!!, cgraph->n_nodes: %d\n", cgraph->n_nodes);
+    // GGML_LOG("rknn graph compute!!!!!!!!, cgraph->n_nodes: %d\n", cgraph->n_nodes);
     
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        printf("ggml-rknn: Processing node %d/%d: %s (%s)\n", 
-               i+1, cgraph->n_nodes, 
-               cgraph->nodes[i]->name, 
-               ggml_op_name(cgraph->nodes[i]->op));
         timing_debug_printf("rknn graph compute node: %d, node->name: %s\n", i, cgraph->nodes[i]->name);
         ggml_tensor * node = cgraph->nodes[i];
 
-        // Only GGML_OP_NONE and GGML_OP_MUL_MAT are supported now
-        // RESHAPE/VIEW/PERMUTE/TRANSPOSE are no longer claimed as supported
-        if (node->op == GGML_OP_NONE) {
+        if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
         }
 
@@ -2191,21 +2054,20 @@ void ggml_backend_rknn_set_n_threads(ggml_backend_t backend_rknn, int n_threads)
         return;
     }
     
-    // timing_debug_printf("ggml-rknn: ggml_backend_rknn_set_n_threads: backend_ptr=%p n_threads=%d\n", (void*)backend_rknn, n_threads);
+    timing_debug_printf("ggml-rknn: ggml_backend_rknn_set_n_threads: backend_ptr=%p n_threads=%d\n", (void*)backend_rknn, n_threads);
     GGML_ASSERT(ggml_backend_is_rknn(backend_rknn));
     ggml_backend_rknn_context * ctx = (ggml_backend_rknn_context *) backend_rknn->context;
     // ctx->n_threads                  = n_threads;
     // if (n_threads > 3) { ctx->n_threads = 3;} 
     
     // TODO: hardcode 6 threads
-    ctx->rknn_threads = 1;
+    ctx->rknn_threads = 6;
     ctx->ggml_threads = n_threads;
 
     // ctx->rknn_config = &local_rknn_config;
     // ctx->timer = rknn_timing_helper();
     ctx->timer = &local_timer;
     local_timer.rknn_threads = n_threads;
-    local_timer.rknn_threads = ctx->rknn_threads;
     // printf("n_threads: %d\n", n_threads);
 }
 
@@ -2226,13 +2088,11 @@ static ggml_backend_i ggml_backend_rknn_i = {
 };
 static int ggml_backend_rknn_n_devices = 1;
 static const char * ggml_backend_rknn_reg_get_name(ggml_backend_reg_t reg) {
-    printf("ggml-rknn: Backend registry get_name called\n");
     return "RKNN";
 
     GGML_UNUSED(reg);
 }
 static size_t ggml_backend_rknn_reg_device_count(ggml_backend_reg_t reg) {
-    printf("ggml-rknn: Backend registry device_count called, returning %zu devices\n", ggml_backend_rknn_n_devices);
     return ggml_backend_rknn_n_devices;
 
     GGML_UNUSED(reg);
@@ -2312,11 +2172,11 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
 
     switch (op->op) {
         case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
             return true;
-        
-        // Don't claim support for RESHAPE/VIEW/PERMUTE/TRANSPOSE
-        // Let CPU backend handle these - reduces graph splitting overhead
-        // (Same as rkllama approach)
 
         case GGML_OP_MUL_MAT:
         {
@@ -2332,17 +2192,11 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                 return false;
             }
 
-            printf("ggml-rknn: supports_op called for: %s\n", op->name);
+            // printf("ggml-rknn: supports_op: %s, %d, %d, %d, %d\n", op->name, op->op, op->ne[1], op->src[0]->ne[0], op->ne[0]);
 
             if(!rknn_config.value("npu_prefill", false) && !rknn_config.value("npu_decode", false)){
-                printf("ggml-rknn: ✗ NPU disabled - npu_prefill=%d, npu_decode=%d\n", 
-                       rknn_config.value("npu_prefill", false), 
-                       rknn_config.value("npu_decode", false));
                 return false;
             }
-
-            printf("ggml-rknn: NPU enabled - checking op: %s, type=%s, ne1=%ld (batch size)\n", 
-                   op->name, ggml_op_name(op->op), op->ne[1]);
 
             // timing_debug_printf("ggml-rknn: supports_op: %s, %s, (%d,%d,%d)\n", op->name, ggml_op_name(op->op), op->ne[1], op->src[0]->ne[0], op->ne[0]);
             // printf("%s, %s, (%d*%d*%d)\n", op->name, ggml_op_name(op->op), op->ne[1], op->src[0]->ne[0], op->ne[0]);
@@ -2372,22 +2226,17 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
             // Use hashset for O(1) lookup instead of O(n) linear search
             if (loaded_nodes_set.find(std::string(op->name)) != loaded_nodes_set.end()) {
                 have_loaded = true;
-                printf("ggml-rknn:   Already loaded node: %s\n", op->name);
+                timing_debug_printf("ggml-rknn: loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
+                // timing_debug_printf(rknn_config["loaded_nodes"].dump().c_str());
             } 
             if (!have_loaded && rknn_config["offload_nodes"].size() > 0) {
-                printf("ggml-rknn:   Checking offload patterns for: %s\n", op->name);
                 for (const auto &node_name : rknn_config["offload_nodes"]) {
-                    std::string pattern_str = node_name.get<std::string>();
-                    printf("ggml-rknn:     Testing pattern: '%s'\n", pattern_str.c_str());
-                    std::regex pattern(pattern_str);
+                    std::regex pattern(node_name.get<std::string>());
                     if (std::regex_match(op->name, pattern)) {
                         to_offload = true;
-                        printf("ggml-rknn:     ✓ MATCHED! Will offload: %s (M=%ld, K=%ld, N=%ld)\n", op->name, ne1, ne00, ne0);
+                        timing_debug_printf("ggml-rknn: offload node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
                         break;
                     }
-                }
-                if (!to_offload) {
-                    printf("ggml-rknn:     ✗ No pattern matched for: %s\n", op->name);
                 }
             }
 
@@ -2419,8 +2268,8 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                     // for RKNN, A/B are type F16/I8, C is type F32/INT32
                     uint64_t temp_allocated_bytes = (ne01 * ne00 + ne11 * ne10) * type_size + ne0 * ne1 * 4;
 
-                    // timing_debug_printf("ggml-rknn: temp_allocated_bytes for %s: (%ld * %ld * %ld) %lu bytes\n", op->name, ne1, ne00, ne0, temp_allocated_bytes);
-                    // timing_debug_printf("ggml-rknn: rknpu2_allocated_bytes: %lu bytes\n", rknpu2_allocated_bytes);
+                    timing_debug_printf("ggml-rknn: temp_allocated_bytes for %s: (%ld * %ld * %ld) %lu bytes\n", op->name, ne1, ne00, ne0, temp_allocated_bytes);
+                    timing_debug_printf("ggml-rknn: rknpu2_allocated_bytes: %lu bytes\n", rknpu2_allocated_bytes);
 
 
                     static std::mutex rknpu2_allocated_bytes_mutex;
@@ -2437,7 +2286,7 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                             loaded_nodes_set.insert(std::string(op->name));
                             rknpu2_allocated_bytes = temp_allocated_bytes;
 
-                            // // timing_debug_printf("ggml-rknn: to offload -> loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
+                            timing_debug_printf("ggml-rknn: to offload -> loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
                             #ifdef RKNN_MATMUL_DEBUG_TIMING_DETAILS
                                 std::string loaded_nodes_str = "{";
                                 for (auto it = loaded_nodes_set.begin(); it != loaded_nodes_set.end(); ++it) {
@@ -2445,14 +2294,14 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                                     loaded_nodes_str += "\"" + *it + "\"";
                                 }
                                 loaded_nodes_str += "}";
-                                // timing_debug_printf("ggml-rknn: loaded_nodes set: %s\n", loaded_nodes_str.c_str());
+                                timing_debug_printf("ggml-rknn: loaded_nodes set: %s\n", loaded_nodes_str.c_str());
                             #endif
                         }
                         else {
-                            // fprintf(stderr, "ggml-rknn: requires too much memory when loading \"%s\" (%ld * %ld * %ld), resting offload_nodes! \n", op->name, ne1, ne00, ne0);
-                            // fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", temp_allocated_bytes, MAX_RKNN_MEMORY);
-                            // fprintf(stderr, "ggml-rknn: local_rknn_config: %s\n", local_rknn_config.dump().c_str());
-                            // fprintf(stderr, "ggml-rknn: rknn_config: %s\n", rknn_config.dump().c_str());
+                            fprintf(stderr, "ggml-rknn: requires too much memory when loading \"%s\" (%ld * %ld * %ld), resting offload_nodes! \n", op->name, ne1, ne00, ne0);
+                            fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", temp_allocated_bytes, MAX_RKNN_MEMORY);
+                            fprintf(stderr, "ggml-rknn: local_rknn_config: %s\n", local_rknn_config.dump().c_str());
+                            fprintf(stderr, "ggml-rknn: rknn_config: %s\n", rknn_config.dump().c_str());
 
                             local_rknn_config["offload_nodes"].clear();
 
@@ -2461,8 +2310,7 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                     }
                 }
             }
-            printf("ggml-rknn: *** FINAL DECISION for %s: %s (to_offload=%d, have_loaded=%d) ***\n", 
-                   op->name, result ? "✓ USE NPU" : "✗ USE CPU", to_offload, have_loaded);
+            // printf("ggml_backend_rknn_device_supports_op: %s, %d, %d, %d, %d\n", op->name, result, ne01, ne00, ne11); // n, k, m in rknn's notation
             return result;
 
         }
@@ -2474,6 +2322,7 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
 
     GGML_UNUSED(dev);
 }
+
 static bool ggml_backend_rknn_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     // RKNN backend can work with CPU buffers (including CPU_REPACK)
     // This is crucial for the scheduler to assign operations to RKNN backend
@@ -2500,15 +2349,6 @@ static bool ggml_backend_rknn_device_supports_buft(ggml_backend_dev_t dev, ggml_
     GGML_UNUSED(dev);
 }
 
-static bool ggml_backend_rknn_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    // This function is called by the scheduler to decide if an operation should be offloaded
-    // We delegate to supports_op for the actual decision
-    printf("ggml-rknn: offload_op called for: %s\n", op->name);
-    bool should_offload = ggml_backend_rknn_device_supports_op(dev, op);
-    printf("ggml-rknn: offload_op decision for %s: %s\n", op->name, should_offload ? "YES" : "NO");
-    return should_offload;
-}
-
 // Forward declare CPU buffer type getter
 extern "C" ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
@@ -2531,7 +2371,7 @@ static const struct ggml_backend_device_i ggml_backend_rknn_device_i = {
     /* .buffer_from_host_ptr = */ ggml_backend_rknn_device_buffer_from_host_ptr,
     /* .supports_op          = */ ggml_backend_rknn_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rknn_device_supports_buft,
-    /* .offload_op           = */ ggml_backend_rknn_device_offload_op,
+    /* .offload_op           = */ NULL,
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
@@ -2606,11 +2446,7 @@ bool ggml_backend_is_rknn(ggml_backend_t backend){
 
 ggml_backend_t ggml_backend_rknn_init(void) {
     // printf("@ggml-rknn.cpp\n");
-    printf("=============================================================\n");
-    printf("ggml-rknn: RKNN Backend Initialization Started\n");
-    printf("ggml-rknn: Make sure you use -ngl parameter to offload layers!\n");
-    printf("ggml-rknn: Example: llama-cli -m model.gguf -ngl 99 -p \"test\"\n");
-    printf("=============================================================\n");
+    printf("ggml-rknn: start rknn init!\n");
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_rknn_reg(), 0);
     printf("ggml-rknn: register the rknn!\n");
     ggml_backend_rknn_context * context = (ggml_backend_rknn_context *) malloc(sizeof(ggml_backend_rknn_context));
@@ -2661,10 +2497,7 @@ void compute_submat_mul( // matrix A row
                         ggml_tensor *src_i,
                         ggml_tensor *src_w,
                         ggml_tensor *dst,
-                        void *A_data,           // Original F32 data
-                        void *A_converted,      // Pre-converted F16/I8 data (can be NULL for decode)
-                        float *A_delta,         // Pre-computed quantization scales (for INT8, can be NULL)
-                        rknn_tensor_mem *A_shared_npu_mem, // Shared NPU memory for A (prefill only, can be NULL)
+                        void *A_data,
                         void *B_data,
                         void *B_data_delta, // only for Q8
                         int64_t col_start,
@@ -2674,7 +2507,6 @@ void compute_submat_mul( // matrix A row
                         rknn_timing_helper *timer_p,
                         int num_cores = 3)
 {
-    printf("ggml-rknn: compute_submat_mul %s:%d, col_start: %ld, col_end: %ld, type: %d\n", dst->name, thread_idx, col_start,  col_end, type);
     int64_t ori_N = src_w->ne[1];
     int64_t M = src_i->ne[1];
     int64_t K = src_w->ne[0];
@@ -2731,57 +2563,30 @@ void compute_submat_mul( // matrix A row
         
     part_AC->is_using = true;
 
-    float * local_A_delta = NULL; // only for q8_0 when A_delta param is NULL
-    
-    // Determine which A memory to use for set_io_mem
-    // If shared NPU memory is provided (prefill), use it; otherwise use part_AC->A
-    rknn_tensor_mem *A_mem_for_io = (A_shared_npu_mem != NULL) ? A_shared_npu_mem : part_AC->A;
+    float * A_delta = NULL; // only for q8_0
 
     // copy A to norm layout (AC_layout=0), memcpy B to kernel
     {
         if (type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32){
             TIMEIT(
-                if (A_shared_npu_mem != NULL) {
-                    // For prefill with shared A: data already in shared NPU memory, skip copy
-                } else if (A_converted != NULL) {
-                    // For prefill without shared mem (fallback): memcpy to NPU buffer
-                    memcpy(part_AC->A->virt_addr, A_converted, A_pad_row_00 * A_pad_col_00 * sizeof(rknpu2::float16));
-                } else {
-                    // For decode (M=1): convert directly (cheaper for single row)
-                    convert_ggml_to_rknn_norm_layout_A_f16((float *)mat_A.pad_data, (rknpu2::float16 *)part_AC->A->virt_addr, A_pad_row_00, A_pad_col_00);
-                }
+                // Use norm layout conversion (2D layout: M x K) instead of perf layout
+                convert_ggml_to_rknn_norm_layout_A_f16((float *)mat_A.pad_data, (rknpu2::float16 *)part_AC->A->virt_addr, A_pad_row_00, A_pad_col_00);
             , &durations[1]);
 
-            // RKNN FIX: Use atomic compare-exchange to ensure only one thread copies B
-            bool expected = false;
-            if(part_B->B_is_copied.compare_exchange_strong(expected, true)){
-                // This thread won the race and will copy B
+            if(!part_B->B_is_copied){
                 TIMEIT(
                     B_memcpy_multithread((float16*)part_B->B->virt_addr, (float16*)mat_B.pad_data, B_pad_row_00, B_pad_col_00);
                 , &durations[2]);
             }
         } else if (type == RKNN_INT8_MM_INT8_TO_INT32){
-            if (A_shared_npu_mem != NULL) {
-                // For prefill with shared A: data already in shared NPU memory, skip copy
-            } else if (A_converted != NULL && A_delta != NULL) {
-                // For prefill without shared mem (fallback): memcpy
-                TIMEIT(
-                    memcpy(part_AC->A->virt_addr, A_converted, A_pad_row_00 * A_pad_col_00 * sizeof(int8_t));
-                , &durations[1]);
-            } else {
-                // For decode (M=1): convert and quantize directly
-                local_A_delta = new float[A_pad_row_00];
-                TIMEIT(
-                    convert_ggml_to_rknn_norm_layout_A_q8((float *)mat_A.pad_data, (int8_t *)part_AC->A->virt_addr, local_A_delta, A_pad_row_00, A_pad_col_00)
-                , &durations[1]);
-                // Point A_delta to local buffer for later use
-                A_delta = local_A_delta;
-            }
+            A_delta = new float[A_pad_row_00];
 
-            // RKNN FIX: Use atomic compare-exchange to ensure only one thread copies B
-            bool expected = false;
-            if(part_B->B_is_copied.compare_exchange_strong(expected, true)){
-                // This thread won the race and will copy B
+            TIMEIT(
+                // Use norm layout conversion (2D layout: M x K) instead of perf layout
+                convert_ggml_to_rknn_norm_layout_A_q8((float *)mat_A.pad_data, (int8_t *)part_AC->A->virt_addr, A_delta, A_pad_row_00, A_pad_col_00)
+            , &durations[1]);
+
+            if(!part_B->B_is_copied){
                 TIMEIT(
                     B_memcpy_multithread((int8_t*)part_B->B->virt_addr, (int8_t*)mat_B.pad_data, B_pad_row_00, B_pad_col_00);
                 , &durations[2]);
@@ -2797,26 +2602,26 @@ void compute_submat_mul( // matrix A row
 
     // set io to rknn
     {
-        // Use shared A memory if provided, otherwise use part_AC->A
+
         TIMEIT(
-            rknn_matmul_set_io_mem(part_AC->ctx, A_mem_for_io, &(part_AC->io_attr.A));
+            rknn_matmul_set_io_mem(part_AC->ctx, part_AC->A, &(part_AC->io_attr.A));
         , &durations[3]);
 
-        // RKNN FIX: Use atomic compare-exchange to ensure only one thread sets B IO
-        bool expected = false;
-        if(part_B->B_is_copied.compare_exchange_strong(expected, true)){
-            // This thread won the race and will set B IO
+        if(!(part_B->B_is_copied))
+        {
+            // if b is not copied, or if it's prefill case
             TIMEIT(
                 rknn_matmul_set_io_mem(part_B->ctx, part_B->B, &(part_B->io_attr.B));
             , &durations[4]);
+
+            //TODO: bad readability of B_is_copied
+            part_B->B_is_copied = true;
         }
 
         if(part_AC->prefill)
         {
-            // For prefill, use part_B->io_attr.B since B data was stored according to decode kernel's B layout
-            // Both decode and prefill use B_layout=1 (NATIVE), so B's io_attr should be from part_B
             TIMEIT(
-                rknn_matmul_set_io_mem(part_AC->ctx, part_B->B, &(part_B->io_attr.B));
+                rknn_matmul_set_io_mem(part_AC->ctx, part_B->B, &(part_AC->io_attr.B));
             , &durations[4]);
         }
 
@@ -2824,11 +2629,8 @@ void compute_submat_mul( // matrix A row
             rknn_matmul_set_io_mem(part_AC->ctx, part_AC->C, &(part_AC->io_attr.C));
         , &durations[5]);
 
-        // Only sync A when NOT using shared memory (shared memory is synced once in main function)
-        // For decode (M=1), the small A buffer doesn't need explicit sync either
-        if (part_AC->prefill && A_shared_npu_mem == NULL) {
-            rknn_mem_sync(part_AC->ctx, part_AC->A, RKNN_MEMORY_SYNC_TO_DEVICE);
-        }
+        // rknn_mem_sync(part_AC->ctx, part_AC->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+        // rknn_mem_sync(part_AC->ctx, part_B->B, RKNN_MEMORY_SYNC_TO_DEVICE);
 
         timing_debug_printf("ggml-rknn: set io time: %d us\n", durations[3] + durations[4] + durations[5]);
         timing_debug_printf("ggml-rknn: set io time A: %d us, B: %d us, C: %d us\n", durations[3], durations[4], durations[5]);
@@ -2844,11 +2646,7 @@ void compute_submat_mul( // matrix A row
         if (ret != 0) {
             printf("ggml-rknn: rknn_matmul_run failed for %s:%d\n", part_B->name, part_AC->thread_idx);
         }
-        
-        // Only sync C for prefill; decode's small C buffer doesn't need explicit sync
-        if (part_AC->prefill) {
-            rknn_mem_sync(part_AC->ctx, part_AC->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
-        }
+        // rknn_mem_sync(part_AC->ctx, part_AC->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
 
         timing_debug_printf("ggml-rknn: rknn_matmul_run duration: %d us\n", durations[6]);
 
@@ -2922,10 +2720,10 @@ void compute_submat_mul( // matrix A row
             timer_p->free_pointer_time += durations[9];
         #endif
 
-        // Clean up local_A_delta if allocated locally (INT8 decode case)
-        if (local_A_delta != NULL) {
-            delete[] local_A_delta;
-            local_A_delta = NULL;
+        // Clean up A_delta if allocated (INT8 case)
+        if (A_delta != NULL) {
+            delete[] A_delta;
+            A_delta = NULL;
         }
     }
 
@@ -3047,8 +2845,10 @@ float arraysCosineSimilarity_v(const T* arr1, const T* arr2, size_t size) {
     C: output (F32) (1, 8192) (M, N)
 */
 static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src_w, ggml_tensor * src_i, ggml_tensor * dst, rknn_matmul_type inference_type) {
+    std::vector<std::thread> threads;
     int rknn_threads = (int)((ggml_backend_rknn_context * )backend->context)->rknn_threads;
     rknn_timing_helper *timer_p = ((ggml_backend_rknn_context *)backend->context)->timer;
+    threads.reserve(rknn_threads);
     
     int N = src_w->ne[1];
     int K = src_w->ne[0];
@@ -3072,7 +2872,6 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src_w, ggml_te
     void * B_native_data;
     void * B_data_delta;
 
-    bool b_cache_hit = (src_w->extra != NULL);
     TIMEIT(
         if (inference_type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32) {
             if (src_w->extra == NULL) {
@@ -3104,11 +2903,6 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src_w, ggml_te
         }
         
     , &duration_b);
-    
-    #ifdef RKNN_MATMUL_DEBUG_TIMING_DETAILS
-    printf("[B data] %s cache (K=%d, N=%d): %d us\n", 
-        b_cache_hit ? "HIT" : "MISS", K, N, duration_b);
-    #endif
 
     #ifdef RKNN_MATMUL_DEBUG_TIMING_INFO
     timer_p->prepare_data_time_B += duration_b;
@@ -3117,68 +2911,14 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src_w, ggml_te
     timing_debug_printf("ggml-rknn: copying weights B duration: %d us\n", duration_b);
 
     int threads_number = rknn_threads;
-    int64_t M = src_i->ne[1];
-    int subN = get_subN(inference_type);
-    GGML_ASSERT(N % subN == 0);
-    int n_quotient = N / subN;
 
-    // For prefill (M > 1): use cached shared NPU A memory and convert data directly to it
-    // This eliminates per-thread memcpy, multiple syncs, and repeated memory allocation
-    void* A_converted = NULL;           // CPU buffer fallback (not used if shared NPU mem works)
-    float* A_delta_shared = NULL;       // Quantization scales for INT8
-    rknn_tensor_mem* A_shared_npu_mem = NULL;  // Shared NPU memory for A (from cache)
-    
-    if (M > 1) {  // Prefill case
-        // Calculate thread 0's N range to create its matmul context
-        int64_t col_start_0 = 0;
-        int64_t col_end_0 = 1 * n_quotient / threads_number * subN;
-        if (col_end_0 > N) col_end_0 = N;
-        int64_t N_thread0 = col_end_0 - col_start_0;
-        
-        // Create matmul pair for thread 0 to get A memory size
-        // Note: This will be cached and reused when thread 0 actually runs
-        ggml_rknpu_matmul_pair rkpair_0 = create_matmul_pair(M, K, N_thread0, inference_type, 0, dst->name, 3);
-        
-        if (rkpair_0.part_AC != NULL && rkpair_0.part_AC->ctx != 0) {
-            // Get or create shared NPU memory from cache
-            A_shared_npu_mem = shared_A_mem_cache.get_or_create(
-                M, K, inference_type, 
-                rkpair_0.part_AC->ctx, 
-                rkpair_0.part_AC->io_attr.A.size);
-            
-            if (A_shared_npu_mem != NULL) {
-                // Convert A directly to shared NPU memory
-                if (inference_type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32) {
-                    convert_ggml_to_rknn_norm_layout_A_f16((float *)src_i->data, 
-                        (rknpu2::float16 *)A_shared_npu_mem->virt_addr, M, K);
-                } else if (inference_type == RKNN_INT8_MM_INT8_TO_INT32) {
-                    A_delta_shared = new float[M];
-                    convert_ggml_to_rknn_norm_layout_A_q8((float *)src_i->data, 
-                        (int8_t *)A_shared_npu_mem->virt_addr, A_delta_shared, M, K);
-                }
-                // Sync once for all threads
-                rknn_mem_sync(rkpair_0.part_AC->ctx, A_shared_npu_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
-                timing_debug_printf("ggml-rknn: prefill A converted to cached shared NPU mem for M=%ld, size=%u\n", 
-                    M, rkpair_0.part_AC->io_attr.A.size);
-            } else {
-                // Fallback to CPU buffer if NPU memory creation fails
-                timing_debug_printf("ggml-rknn: failed to get shared NPU mem from cache, falling back to CPU buffer\n");
-                if (inference_type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32) {
-                    A_converted = malloc(M * K * sizeof(rknpu2::float16));
-                    convert_ggml_to_rknn_norm_layout_A_f16((float *)src_i->data, (rknpu2::float16 *)A_converted, M, K);
-                } else if (inference_type == RKNN_INT8_MM_INT8_TO_INT32) {
-                    A_converted = malloc(M * K * sizeof(int8_t));
-                    A_delta_shared = new float[M];
-                    convert_ggml_to_rknn_norm_layout_A_q8((float *)src_i->data, (int8_t *)A_converted, A_delta_shared, M, K);
-                }
-            }
-        }
-    }
-
-    std::vector<std::thread> threads;
-    threads.reserve(threads_number);
-    
     for(int t = 0; t < threads_number; t++){
+        //TODO: assert sub_n is divisible by 16, consider the padding later 
+        // devide b for multi thread
+        int subN = get_subN(inference_type);
+
+        GGML_ASSERT(N % subN == 0);
+        int n_quotient = N / subN;
         int64_t col_start = t * n_quotient / threads_number * subN;
         int64_t col_end = (t + 1) * n_quotient / threads_number * subN;
         if (col_end > N){
@@ -3193,25 +2933,21 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src_w, ggml_te
         void * B_compute_data_delta = (void *)((float *)B_data_delta + col_start);
 
         void * A_compute_data = src_i->data; // src_i is in F32 
+        // void * B_compute_data = B_data;
 
         // run the thread;
-        threads.emplace_back([A_compute_data, A_converted, A_delta_shared, A_shared_npu_mem, B_compute_data, B_compute_data_delta, dst, col_start, col_end, t, inference_type, src_i, src_w, timer_p](){
-            compute_submat_mul(src_i, src_w, dst, A_compute_data, A_converted, A_delta_shared, A_shared_npu_mem, B_compute_data, B_compute_data_delta, col_start, col_end, t, inference_type, timer_p);
+        threads.emplace_back([A_compute_data, B_compute_data, B_compute_data_delta, dst, col_start, col_end, t, inference_type, src_i, src_w, timer_p](){
+            compute_submat_mul(src_i, src_w, dst, A_compute_data, B_compute_data, B_compute_data_delta, col_start, col_end, t, inference_type, timer_p);
         });
     }
+    // #ifdef RKNN_MATMUL_DEBUG
+    // printf("layer_name: %s\n", dst->name);
+    // #endif 
 
     for (auto & th : threads) {
         th.join();
     }
 
-    // Shared NPU A memory is cached, don't destroy it here
-    // Clean up CPU fallback buffer only
-    if (A_converted != NULL) {
-        free(A_converted);
-    }
-    if (A_delta_shared != NULL) {
-        delete[] A_delta_shared;
-    }
 }
 
 // typedef void (*ggml_rk_func_t)(ggml_backend_t backend, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst, rknn_matmul_type type);
@@ -3247,7 +2983,7 @@ bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
         ggml_rk_mul_mat(backend, tensor->src[0], tensor->src[1], tensor, matmul_type)
     , &((ggml_backend_rknn_context *)backend->context)->timer->total_run_time);
 
-    printf("ggml-rknn: processed tensor: %s, (%d,%d,%d) \n", tensor->name, tensor->ne[1], src0->ne[0], tensor->ne[0]);
+    // printf("ggml-rknn: processed tensor: %s, (%d,%d,%d) \n", tensor->name, tensor->ne[1], src0->ne[0], tensor->ne[0]);
 
     #ifdef RKNN_MATMUL_DEBUG_TIMING_INFO
         if (strstr(tensor->name, "output") != NULL || strcmp(tensor->name, "node_0") == 0){
