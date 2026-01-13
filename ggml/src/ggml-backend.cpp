@@ -825,6 +825,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
             // check if a backend with higher prio wants to offload the op
+            fprintf(stderr, "\n=== RKNN DEBUG: Checking offload for op %s ===\n", ggml_op_name(tensor->op));
+            fprintf(stderr, "  tensor name: %s\n", tensor->name);
+            fprintf(stderr, "  src tensor: %s\n", src ? src->name : "NULL");
+            if (src && src->buffer) {
+                fprintf(stderr, "  src buffer name: %s\n", ggml_backend_buffer_name(src->buffer));
+                fprintf(stderr, "  src backend_id: %d\n", src_backend_id);
+                fprintf(stderr, "  n_backends: %d\n", sched->n_backends);
+                fprintf(stderr, "  is CPU backend: %s\n", (src_backend_id == sched->n_backends - 1) ? "YES" : "NO");
+                fprintf(stderr, "  is host buffer: %s\n", ggml_backend_buffer_is_host(src->buffer) ? "YES" : "NO");
+                fprintf(stderr, "  op_offload enabled: %s\n", sched->op_offload ? "YES" : "NO");
+            }
             if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                 for (int b = 0; b < src_backend_id; b++) {
                     if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
