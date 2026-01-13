@@ -2102,7 +2102,7 @@ static inline unsigned long long timespec_ns(const struct timespec * ts){
 }
 
 static ggml_status ggml_backend_rknn_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    // GGML_LOG("rknn graph compute!!!!!!!!, cgraph->n_nodes: %d\n", cgraph->n_nodes);
+    GGML_LOG("rknn graph compute!!!!!!!!, cgraph->n_nodes: %d\n", cgraph->n_nodes);
     
     for (int i = 0; i < cgraph->n_nodes; i++) {
         timing_debug_printf("rknn graph compute node: %d, node->name: %s\n", i, cgraph->nodes[i]->name);
@@ -2181,7 +2181,7 @@ void ggml_backend_rknn_set_n_threads(ggml_backend_t backend_rknn, int n_threads)
         return;
     }
     
-    timing_debug_printf("ggml-rknn: ggml_backend_rknn_set_n_threads: backend_ptr=%p n_threads=%d\n", (void*)backend_rknn, n_threads);
+    // timing_debug_printf("ggml-rknn: ggml_backend_rknn_set_n_threads: backend_ptr=%p n_threads=%d\n", (void*)backend_rknn, n_threads);
     GGML_ASSERT(ggml_backend_is_rknn(backend_rknn));
     ggml_backend_rknn_context * ctx = (ggml_backend_rknn_context *) backend_rknn->context;
     // ctx->n_threads                  = n_threads;
@@ -2322,17 +2322,17 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                 return false;
             }
 
-            printf("ggml-rknn: supports_op: %s, %d, %d, %d, %d\n", op->name, op->op, op->ne[1], op->src[0]->ne[0], op->ne[0]);
+            // printf("ggml-rknn: supports_op: %s, %d, %d, %d, %d\n", op->name, op->op, op->ne[1], op->src[0]->ne[0], op->ne[0]);
 
             if(!rknn_config.value("npu_prefill", false) && !rknn_config.value("npu_decode", false)){
-                printf("ggml-rknn: NPU disabled - npu_prefill=%d, npu_decode=%d\n", 
-                       rknn_config.value("npu_prefill", false), 
-                       rknn_config.value("npu_decode", false));
+                // printf("ggml-rknn: NPU disabled - npu_prefill=%d, npu_decode=%d\n", 
+                    //    rknn_config.value("npu_prefill", false), 
+                    //    rknn_config.value("npu_decode", false));
                 return false;
             }
 
-            printf("ggml-rknn: Checking op: %s, type=%s, ne1=%d (batch size)\n", 
-                   op->name, ggml_op_name(op->op), (int)op->ne[1]);
+            // printf("ggml-rknn: Checking op: %s, type=%s, ne1=%d (batch size)\n", 
+                //    op->name, ggml_op_name(op->op), (int)op->ne[1]);
 
             // timing_debug_printf("ggml-rknn: supports_op: %s, %s, (%d,%d,%d)\n", op->name, ggml_op_name(op->op), op->ne[1], op->src[0]->ne[0], op->ne[0]);
             // printf("%s, %s, (%d*%d*%d)\n", op->name, ggml_op_name(op->op), op->ne[1], op->src[0]->ne[0], op->ne[0]);
@@ -2362,24 +2362,24 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
             // Use hashset for O(1) lookup instead of O(n) linear search
             if (loaded_nodes_set.find(std::string(op->name)) != loaded_nodes_set.end()) {
                 have_loaded = true;
-                timing_debug_printf("ggml-rknn: loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
+                // timing_debug_printf("ggml-rknn: loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
                 // timing_debug_printf(rknn_config["loaded_nodes"].dump().c_str());
             } 
             if (!have_loaded && rknn_config["offload_nodes"].size() > 0) {
-                printf("ggml-rknn: Checking offload patterns for node: %s\n", op->name);
+                // printf("ggml-rknn: Checking offload patterns for node: %s\n", op->name);
                 for (const auto &node_name : rknn_config["offload_nodes"]) {
                     std::string pattern_str = node_name.get<std::string>();
-                    printf("ggml-rknn:   Testing pattern: %s\n", pattern_str.c_str());
+                    // printf("ggml-rknn:   Testing pattern: %s\n", pattern_str.c_str());
                     std::regex pattern(pattern_str);
                     if (std::regex_match(op->name, pattern)) {
                         to_offload = true;
-                        printf("ggml-rknn: ✓ MATCHED! Will offload node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
-                        timing_debug_printf("ggml-rknn: offload node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
+                        // printf("ggml-rknn: ✓ MATCHED! Will offload node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
+                        // timing_debug_printf("ggml-rknn: offload node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
                         break;
                     }
                 }
                 if (!to_offload) {
-                    printf("ggml-rknn: ✗ No pattern matched for node: %s\n", op->name);
+                    // printf("ggml-rknn: ✗ No pattern matched for node: %s\n", op->name);
                 }
             }
 
@@ -2411,8 +2411,8 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                     // for RKNN, A/B are type F16/I8, C is type F32/INT32
                     uint64_t temp_allocated_bytes = (ne01 * ne00 + ne11 * ne10) * type_size + ne0 * ne1 * 4;
 
-                    timing_debug_printf("ggml-rknn: temp_allocated_bytes for %s: (%ld * %ld * %ld) %lu bytes\n", op->name, ne1, ne00, ne0, temp_allocated_bytes);
-                    timing_debug_printf("ggml-rknn: rknpu2_allocated_bytes: %lu bytes\n", rknpu2_allocated_bytes);
+                    // timing_debug_printf("ggml-rknn: temp_allocated_bytes for %s: (%ld * %ld * %ld) %lu bytes\n", op->name, ne1, ne00, ne0, temp_allocated_bytes);
+                    // timing_debug_printf("ggml-rknn: rknpu2_allocated_bytes: %lu bytes\n", rknpu2_allocated_bytes);
 
 
                     static std::mutex rknpu2_allocated_bytes_mutex;
@@ -2429,7 +2429,7 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                             loaded_nodes_set.insert(std::string(op->name));
                             rknpu2_allocated_bytes = temp_allocated_bytes;
 
-                            timing_debug_printf("ggml-rknn: to offload -> loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
+                            // // timing_debug_printf("ggml-rknn: to offload -> loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
                             #ifdef RKNN_MATMUL_DEBUG_TIMING_DETAILS
                                 std::string loaded_nodes_str = "{";
                                 for (auto it = loaded_nodes_set.begin(); it != loaded_nodes_set.end(); ++it) {
@@ -2437,14 +2437,14 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                                     loaded_nodes_str += "\"" + *it + "\"";
                                 }
                                 loaded_nodes_str += "}";
-                                timing_debug_printf("ggml-rknn: loaded_nodes set: %s\n", loaded_nodes_str.c_str());
+                                // timing_debug_printf("ggml-rknn: loaded_nodes set: %s\n", loaded_nodes_str.c_str());
                             #endif
                         }
                         else {
-                            fprintf(stderr, "ggml-rknn: requires too much memory when loading \"%s\" (%ld * %ld * %ld), resting offload_nodes! \n", op->name, ne1, ne00, ne0);
-                            fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", temp_allocated_bytes, MAX_RKNN_MEMORY);
-                            fprintf(stderr, "ggml-rknn: local_rknn_config: %s\n", local_rknn_config.dump().c_str());
-                            fprintf(stderr, "ggml-rknn: rknn_config: %s\n", rknn_config.dump().c_str());
+                            // fprintf(stderr, "ggml-rknn: requires too much memory when loading \"%s\" (%ld * %ld * %ld), resting offload_nodes! \n", op->name, ne1, ne00, ne0);
+                            // fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", temp_allocated_bytes, MAX_RKNN_MEMORY);
+                            // fprintf(stderr, "ggml-rknn: local_rknn_config: %s\n", local_rknn_config.dump().c_str());
+                            // fprintf(stderr, "ggml-rknn: rknn_config: %s\n", rknn_config.dump().c_str());
 
                             local_rknn_config["offload_nodes"].clear();
 
@@ -2454,8 +2454,8 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                 }
             }
             // printf("ggml_backend_rknn_device_supports_op: %s, %d, %d, %d, %d\n", op->name, result, ne01, ne00, ne11); // n, k, m in rknn's notation
-            printf("ggml-rknn: Final decision for %s: %s (to_offload=%d, have_loaded=%d, result=%d)\n", 
-                   op->name, result ? "USE NPU" : "USE CPU", to_offload, have_loaded, result);
+            // printf("ggml-rknn: Final decision for %s: %s (to_offload=%d, have_loaded=%d, result=%d)\n", 
+                //    op->name, result ? "USE NPU" : "USE CPU", to_offload, have_loaded, result);
             return result;
 
         }
@@ -2627,6 +2627,7 @@ void compute_submat_mul( // matrix A row
                         rknn_timing_helper *timer_p,
                         int num_cores = 3)
 {
+    printf("ggml-rknn: compute_submat_mul %s:%d, col_start: %ld, col_end: %ld, type: %d\n", dst->name, thread_idx, col_start,  col_end, type);
     int64_t ori_N = src_w->ne[1];
     int64_t M = src_i->ne[1];
     int64_t K = src_w->ne[0];
@@ -3195,7 +3196,7 @@ bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
         ggml_rk_mul_mat(backend, tensor->src[0], tensor->src[1], tensor, matmul_type)
     , &((ggml_backend_rknn_context *)backend->context)->timer->total_run_time);
 
-    // printf("ggml-rknn: processed tensor: %s, (%d,%d,%d) \n", tensor->name, tensor->ne[1], src0->ne[0], tensor->ne[0]);
+    printf("ggml-rknn: processed tensor: %s, (%d,%d,%d) \n", tensor->name, tensor->ne[1], src0->ne[0], tensor->ne[0]);
 
     #ifdef RKNN_MATMUL_DEBUG_TIMING_INFO
         if (strstr(tensor->name, "output") != NULL || strcmp(tensor->name, "node_0") == 0){
